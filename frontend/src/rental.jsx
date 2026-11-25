@@ -1549,7 +1549,7 @@ function OwnerList({ apiBase, resource, render, empty }) {
   </>}</RentalResult>;
 }
 
-function OwnerSettlement({ apiBase, id }) {
+function OwnerSettlement({ apiBase, id, openSettlement }) {
   const result = useRentalData(apiBase, `owner/settlements/${id}`);
   return <RentalResult result={result}>{(row) => <>
     <div className="panel rental-metric">
@@ -1561,10 +1561,12 @@ function OwnerSettlement({ apiBase, id }) {
         ["opening_available_balance", "期首残高", "money"],
         ["collected_income", "収納額", "money"], ["management_fee", "管理料", "money"],
         ["approved_expenses", "修繕控除", "money"], ["adjustment_amount", "調整額", "money"],
-        ["payable_amount", "模擬送金予定額", "money"], ["closing_available_balance", "期末残高", "money"],
+        ["payable_amount", row.carry_out ? "確定時の送金可能額" : "模擬送金予定額", "money"], ["closing_available_balance", "期末残高", "money"],
         ["outstanding_expense_balance", "未控除費用", "money"],
       ]}/>
     </div>
+    {row.carry_out && <MoneyRow title="後続精算へ繰越" balance={yen.format(row.carry_out.amount)}
+      onClick={() => openSettlement(row.carry_out.settlement_id)} actionLabel="繰越先の精算を開く"/>}
     <h3>精算明細</h3>
     <MoneyList rows={row.lines} empty="精算明細はありません。" render={(line) => <MoneyRow
       title={settlementLineLabels[line.line_type] || line.line_type}
@@ -1573,8 +1575,8 @@ function OwnerSettlement({ apiBase, id }) {
         ? 0 - line.amount : line.amount)}/>}/>
     <h3>模擬送金履歴</h3>
     <MoneyList rows={row.remittances} empty="模擬送金の記録はありません。" render={(item) => <MoneyRow
-      title={remittanceStatuses[item.status]} description={item.remitted_date || item.scheduled_date}
-      balance={yen.format(item.actual_amount ?? item.scheduled_amount)}/>}/>
+      title={item.carried_forward ? "後続精算へ繰越" : remittanceStatuses[item.status]} description={item.remitted_date || item.scheduled_date}
+      balance={yen.format(item.carried_forward ? row.carry_out.amount : item.actual_amount ?? item.scheduled_amount)}/>}/>
   </>}</RentalResult>;
 }
 
@@ -1601,13 +1603,14 @@ function OwnerPortal({ apiBase }) {
       <div hidden={settlementId !== null}>
         <OwnerList apiBase={apiBase} resource="settlements" empty="確定済みの精算はありません。"
           render={(row) => <MoneyRow title={`${row.settlement_month.slice(0, 7)} · ${row.contract_code}`}
-            description={row.settlement_code} balance={`模擬送金予定 ${yen.format(row.payable_amount)}`}
+            description={row.settlement_code} balance={row.carry_out ? `後続精算へ繰越 ${yen.format(row.carry_out.amount)}`
+              : `模擬送金予定 ${yen.format(row.payable_amount)}`}
             onClick={() => setSettlementId(row.id)} actionLabel="精算詳細"/>}/>
       </div>
       {settlementId !== null && <div className="rental-stack">
         <div className="rental-controls"><button type="button" className="secondary-btn"
           onClick={() => setSettlementId(null)}>精算一覧に戻る</button></div>
-        <OwnerSettlement apiBase={apiBase} id={settlementId}/>
+        <OwnerSettlement key={settlementId} apiBase={apiBase} id={settlementId} openSettlement={setSettlementId}/>
       </div>}
     </section>
     <section aria-labelledby="owner-repairs">

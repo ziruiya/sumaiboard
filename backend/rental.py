@@ -671,7 +671,7 @@ def register_rental_routes(app, connect, require_actor, audit):
         WHERE s.tenant_id=? AND c.owner_party_id=? AND s.status='FINALIZED'
     """
     owner_settlement_fields = """
-        s.id, s.settlement_code, s.settlement_month, s.status, c.contract_code,
+        s.id, s.settlement_code, s.settlement_month, s.status, c.contract_code, s.management_contract_id,
         s.collected_income, s.management_fee, s.approved_expenses, s.adjustment_amount,
         s.payable_amount, s.opening_available_balance, s.closing_available_balance,
         s.outstanding_expense_balance
@@ -732,7 +732,7 @@ def register_rental_routes(app, connect, require_actor, audit):
                 (TENANT_ID, owner_id, year, today),
             ).fetchone()["amount"]
             cumulative = db.execute(
-                f"""SELECT COALESCE(SUM(s.collected_income-s.management_fee-s.approved_expenses),0) AS amount
+                f"""SELECT COALESCE(SUM(s.collected_income-s.management_fee-s.approved_expenses-s.adjustment_amount),0) AS amount
                     {owner_settlement_scope}""", (TENANT_ID, owner_id),
             ).fetchone()["amount"]
         managed = int(occupancy["managed_unit_count"])
@@ -755,15 +755,20 @@ def register_rental_routes(app, connect, require_actor, audit):
             if history:
                 return db.execute(
                     """SELECT cu.id, b.id AS building_id, b.building_name, u.id AS unit_id, u.unit_number,
-                              c.contract_code, cu.valid_from, cu.valid_to
+                              c.contract_code, GREATEST(cu.valid_from,c.start_date) AS valid_from,
+                              CASE WHEN cu.valid_to IS NULL THEN c.end_date
+                                   WHEN c.end_date IS NULL THEN cu.valid_to
+                                   ELSE LEAST(cu.valid_to,c.end_date) END AS valid_to
                        FROM management_contracts c
                        JOIN management_contract_units cu ON cu.tenant_id=c.tenant_id AND cu.management_contract_id=c.id
                        JOIN units u ON u.tenant_id=cu.tenant_id AND u.id=cu.unit_id
                        JOIN buildings b ON b.tenant_id=u.tenant_id AND b.id=u.building_id
                        WHERE c.tenant_id=? AND c.owner_party_id=? AND c.status IN ('ACTIVE','ENDED')
-                         AND cu.valid_from<=?
+                         AND GREATEST(cu.valid_from,c.start_date)<=?
+                         AND (cu.valid_to IS NULL OR cu.valid_to>=GREATEST(cu.valid_from,c.start_date))
+                         AND (c.end_date IS NULL OR c.end_date>=GREATEST(cu.valid_from,c.start_date))
                          AND (u.owner_party_id<>c.owner_party_id OR cu.valid_to<? OR c.end_date<?)
-                       ORDER BY b.id,u.id,cu.valid_from DESC,cu.id DESC LIMIT ? OFFSET ?""",
+                       ORDER BY b.id,u.id,valid_from DESC,cu.id DESC LIMIT ? OFFSET ?""",
                     (TENANT_ID, owner_id, today, today, today, limit, offset),
                 ).fetchall()
             return db.execute(
@@ -781,15 +786,23 @@ def register_rental_routes(app, connect, require_actor, audit):
                 (today, today, today, today, TENANT_ID, owner_id, limit, offset),
             ).fetchall()
 
+    def owner_settlement_carry(db, row):
+        # The successor lookup stays within the same tenant and management contract.
+        row["carry_out"] = settlement_carry_out(db, row)
+        del row["management_contract_id"]
+        return row
+
     @router.get("/owner/settlements")
     def owner_settlements(limit: int = Query(50, ge=1, le=100),
                           offset: int = Query(0, ge=0), owner_id=Depends(require_owner)):
         with connect() as db:
-            return db.execute(
+            rows = db.execute(
                 f"""SELECT {owner_settlement_fields} {owner_settlement_scope}
                     ORDER BY s.settlement_month DESC,s.id DESC LIMIT ? OFFSET ?""",
                 (TENANT_ID, owner_id, limit, offset),
             ).fetchall()
+
+            return [owner_settlement_carry(db, row) for row in rows]
 
     @router.get("/owner/settlements/{settlement_id}")
     def owner_settlement(settlement_id: int, owner_id=Depends(require_owner)):
@@ -817,10 +830,14 @@ def register_rental_routes(app, connect, require_actor, audit):
                     ) published ON published.tenant_id=l.tenant_id AND published.id=l.settlement_id
                     ORDER BY l.id""", (TENANT_ID, owner_id, settlement_id),
             ).fetchall()
+            owner_settlement_carry(db, row)
             row["remittances"] = db.execute(
-                f"""SELECT r.id,r.status,r.scheduled_amount,r.actual_amount,r.scheduled_date,r.remitted_date
+                f"""SELECT r.id,r.status,r.scheduled_amount,r.actual_amount,r.scheduled_date,r.remitted_date,r.failure_reason
                     {owner_remittance_scope} AND s.id=? ORDER BY r.id""", (TENANT_ID, owner_id, settlement_id),
             ).fetchall()
+            for remittance in row["remittances"]:
+                remittance["carried_forward"] = remittance_carried_forward(row, remittance)
+                del remittance["failure_reason"]
             row["remittance_label"] = "模擬送金"
             return row
 
@@ -2645,6 +2662,12 @@ def register_rental_routes(app, connect, require_actor, audit):
                             original_scheduled_amount=carry.get("original_scheduled_amount", row["payable_amount"]))
         return None
 
+    def remittance_carried_forward(row, remittance):
+        return bool(row["carry_out"]) and (
+            remittance["status"] in {"SCHEDULED", "FAILED"}
+            or (remittance["status"] == "CANCELLED" and remittance["failure_reason"] == "後続の精算へ繰越")
+        )
+
     def settlement_detail(db, row):
         row = decode(row)
         row["carry_out"] = settlement_carry_out(db, row)
@@ -2656,10 +2679,7 @@ def register_rental_routes(app, connect, require_actor, audit):
             ).fetchall()
         ]
         for remittance in row["remittances"]:
-            remittance["carried_forward"] = bool(row["carry_out"]) and (
-                remittance["status"] in {"SCHEDULED", "FAILED"}
-                or (remittance["status"] == "CANCELLED" and remittance["failure_reason"] == "後続の精算へ繰越")
-            )
+            remittance["carried_forward"] = remittance_carried_forward(row, remittance)
         row["contract_code"] = get(db, "management_contracts", row["management_contract_id"])["contract_code"]
         row["remittance_label"] = "模擬送金"
         return row
