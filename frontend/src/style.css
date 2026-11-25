@@ -779,6 +779,15 @@
   padding: 1rem;
 }
 
+.rental-metric-action {
+  height: auto;
+  padding: 1rem;
+  display: grid;
+  justify-content: stretch;
+  width: 100%;
+  text-align: start;
+}
+
 .rental-metric strong {
   font-size: 1.55rem;
 }

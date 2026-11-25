@@ -50,16 +50,37 @@ function RentalResult({ result, children }) {
   return children(result.data);
 }
 
-function RentalDashboard({ apiBase }) {
+function RentalDashboard({ apiBase, onNavigate }) {
   const result = useRentalData(apiBase, "summary");
-  return <RentalResult result={result}>{(data) => <>
+  return <RentalResult result={result}>{(data) => <div className="rental-stack">
     <p className="muted">集計月 {data.service_month.slice(0, 7)}</p>
     <div className="rental-metrics">
+      <button type="button" className="secondary-btn rental-metric rental-metric-action"
+        onClick={() => onNavigate("rent", "請求")}>
+        <span>当月請求分未収</span>
+        <strong>{yen.format(data.outstanding_amount)}</strong>
+        <span>{number.format(data.outstanding_charge_count)} 件</span>
+      </button>
+      <button type="button" className="secondary-btn rental-metric rental-metric-action"
+        onClick={() => onNavigate("rent", "入金")}>
+        <span>未消込入金</span><strong>{number.format(data.unallocated_payment_count)} 件</strong>
+      </button>
+      <button type="button" className="secondary-btn rental-metric rental-metric-action"
+        onClick={() => onNavigate("settlements")}>
+        <span>精算承認待ち</span><strong>{number.format(data.pending_settlement_approval_count)} 件</strong>
+      </button>
+      <div className="panel rental-metric">
+        <span>緊急の修繕・苦情</span>
+        <button type="button" className="secondary-btn" onClick={() => onNavigate("repairs", "work-orders")}>
+          修繕 {number.format(data.urgent_work_order_count)} 件
+        </button>
+        <button type="button" className="secondary-btn" onClick={() => onNavigate("repairs", "complaints")}>
+          苦情 {number.format(data.urgent_complaint_count)} 件
+        </button>
+      </div>
+    </div>
+    <div className="rental-metrics">
       {[
-        ["当月請求分未収額", yen.format(data.outstanding_amount)],
-        ["未消込入金", `${number.format(data.unallocated_payment_count)} 件`],
-        ["緊急苦情", `${number.format(data.urgent_complaint_count)} 件`],
-        ["精算承認待ち", `${number.format(data.pending_settlement_approval_count)} 件`],
         ["当月請求額", yen.format(data.billed_amount)],
         ["当月請求分消込額", yen.format(data.allocated_amount)],
         ["物件数", `${number.format(data.building_count)} 棟`],
@@ -70,19 +91,19 @@ function RentalDashboard({ apiBase }) {
         {label === "入居率" && <small>{data.occupied_unit_count} / {data.managed_unit_count} 管理戸数</small>}
       </div>)}
     </div>
-  </>}</RentalResult>;
+  </div>}</RentalResult>;
 }
 
-export default function RentalPage({ page, apiBase, accountRole, userId }) {
+export default function RentalPage({ page, apiBase, accountRole, userId, view, onNavigate }) {
   const title = rentalPages.find(([id]) => id === page)?.[1];
   if (!title) return null;
   return <section className="rental-page">
     <h1>{page === "dashboard" ? "管理業務ダッシュボード" : title}</h1>
-    {page === "dashboard" ? <RentalDashboard apiBase={apiBase}/>
+    {page === "dashboard" ? <RentalDashboard apiBase={apiBase} onNavigate={onNavigate}/>
       : page === "properties" ? <RentalProperties apiBase={apiBase}/>
         : page === "applications" ? <RentalPipeline apiBase={apiBase}/>
-          : page === "rent" ? <RentalRent apiBase={apiBase}/>
-            : page === "repairs" ? <RentalRepairs apiBase={apiBase}/>
+          : page === "rent" ? <RentalRent apiBase={apiBase} initialView={view === "入金" ? view : "請求"}/>
+            : page === "repairs" ? <RentalRepairs apiBase={apiBase} initialTab={view === "complaints" ? view : "work-orders"}/>
             : page === "settlements" ? <RentalSettlements apiBase={apiBase} accountRole={accountRole} userId={userId}/>
               : page === "funds" ? <RentalFunds apiBase={apiBase}/>
               : accountRole === "owner" ? <OwnerPortal apiBase={apiBase}/> : null}
@@ -996,8 +1017,8 @@ function RentDeposits({ apiBase }) {
   </>}</RentalResult>;
 }
 
-function RentalRent({ apiBase }) {
-  const [view, setView] = useState("請求");
+function RentalRent({ apiBase, initialView }) {
+  const [view, setView] = useState(initialView);
   const views = { "請求": RentCharges, "入金": RentPayments, "消込": RentAllocation, "滞納": RentOverdue, "敷金": RentDeposits };
   const View = views[view];
   return <div className="rental-stack">
@@ -1484,8 +1505,8 @@ function CaseRecord({ apiBase, resource, row, reload, open }) {
   </div>;
 }
 
-function RentalRepairs({ apiBase }) {
-  const [tab, setTab] = useState("work-orders");
+function RentalRepairs({ apiBase, initialTab }) {
+  const [tab, setTab] = useState(initialTab);
   const [history, setHistory] = useState([]);
   const view = history.at(-1);
   const open = (resource, id) => setHistory((current) => [...current, { resource, id }]);

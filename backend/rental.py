@@ -601,7 +601,8 @@ def rental_summary(db, today):
         """SELECT
                COALESCE(SUM(total.amount),0) AS billed_amount,
                COALESCE(SUM(total.allocated),0) AS allocated_amount,
-               COALESCE(SUM(total.amount - total.allocated),0) AS outstanding_amount
+               COALESCE(SUM(total.amount - total.allocated),0) AS outstanding_amount,
+               COUNT(CASE WHEN total.amount > total.allocated THEN 1 END) AS outstanding_charge_count
            FROM (
                SELECT c.id, c.amount, COALESCE(SUM(
                    CASE WHEN a.reversal_of_id IS NULL THEN a.amount ELSE -ABS(a.amount) END
@@ -622,9 +623,11 @@ def rental_summary(db, today):
                 AND status IN ('UNALLOCATED', 'PARTIALLY_ALLOCATED')) AS unallocated_payment_count,
             (SELECT COUNT(*) FROM complaints WHERE tenant_id=? AND urgency='URGENT'
                 AND status IN ('OPEN', 'IN_PROGRESS')) AS urgent_complaint_count,
+            (SELECT COUNT(*) FROM work_orders WHERE tenant_id=? AND urgency='URGENT'
+                AND status IN ('RECEIVED', 'ESTIMATED', 'APPROVED', 'ARRANGED')) AS urgent_work_order_count,
             (SELECT COUNT(*) FROM owner_settlements WHERE tenant_id=? AND status='SUBMITTED')
                 AS pending_settlement_approval_count""",
-        (TENANT_ID, TENANT_ID, TENANT_ID, today, TENANT_ID, TENANT_ID),
+        (TENANT_ID, TENANT_ID, TENANT_ID, today, TENANT_ID, TENANT_ID, TENANT_ID),
     ).fetchone()
     managed = int(occupancy["managed_units"])
     occupied = int(occupancy["occupied_units"])

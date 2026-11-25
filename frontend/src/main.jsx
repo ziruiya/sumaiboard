@@ -1155,7 +1155,7 @@ function App() {
     demoAvailable={demoAvailable} error={loginError} busy={busy} onLogin={login}/></>;
   const navItems = data.account_role === "owner" ? rentalPages.slice(-1)
     : data.account_role === "hr" ? [["accounts", t("accounts")]]
-      : [...rentalPages, ["team", t("collaboration")], ["management", t("management")],
+      : [...rentalPages.filter(([id]) => id !== "owner-portal"), ["team", t("collaboration")], ["management", t("management")],
         ["settings", t("settings")],
         ...(data.account_role === "administrator" ? [["accounts", t("accounts")]] : [])];
   const homePage = navItems[0][0];
@@ -1255,6 +1255,8 @@ function App() {
         apiBase={API_BASE}
         accountRole={data.account_role}
         userId={data.user.id}
+        view={workspaceView}
+        onNavigate={(target, view = "home") => { setWorkspaceView(view); setPage(target); }}
       />
       {page === "households" && <Households locale={locale} items={filtered} stores={data.stores} t={t} onOpen={openHousehold} businessFilter={businessFilter} matchedTasks={matchedTasks} terminalExcludedTaskCount={terminalExcludedTaskCount} onClearBusinessFilter={() => setBusinessFilter("")} searchFeedback={searchFeedback}/>}
       {page === "introductions" && <Introductions locale={locale} items={filtered} t={t} onOpen={openHousehold}
