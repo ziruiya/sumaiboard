@@ -102,6 +102,8 @@ const statuses = {
   MANAGEMENT: "管理料", REPAIR: "修繕費",
 };
 
+const unitStates = [["management_status", "管理状態"], ["occupancy_status", "入居状態"]];
+const cancelLease = ["cancel", "契約を取り消す", [["cancellation_reason", "取消理由"]]];
 const occupation = ["VACANT", "APPLYING", "CONTRACTING", "OCCUPIED", "TERMINATION_PENDING"];
 const outside = ["NOT_STARTED_SAMPLE", "IN_PROGRESS_SAMPLE", "RECORDED_SAMPLE"];
 const disclaimer = "本画面は外部サービスの利用を想定したデモです。実際のAPI連携・電子署名は行っていません。";
@@ -122,7 +124,6 @@ const resources = {
     fields: [
       ["building_id", "建物", "@buildings"], ["unit_number", "部屋番号"], ["owner_party_id", "オーナー", "@parties"],
       ["advertised_rent", "募集家賃（円）", "integer"], ["advertised_common_fee", "募集共益費（円）", "integer"],
-      ["management_status", "管理状態", ["MANAGED", "UNMANAGED"]], ["occupancy_status", "入居状態", occupation],
       ["floor_number", "階", "optionalInteger"], ["floor_area", "面積（㎡）", "decimal"],
       ["layout_type", "間取り", "optional"], ["notes", "備考", "notes"],
     ],
@@ -203,8 +204,8 @@ const actionSpec = {
     APPROVED: [["create-lease", "契約を作成"], ["withdraw", "取下げ", [["cancellation_reason", "取下げ理由"]]]],
   },
   leases: {
-    DRAFT: [["sign", "署名日を記録", [["signed_date", "署名日", "optionalDate"]]]],
-    SIGNED: [["move-in", "入居を記録", [["actual_move_in_date", "入居日", "optionalDate"]]]],
+    DRAFT: [["sign", "署名日を記録", [["signed_date", "署名日", "optionalDate"]]], cancelLease],
+    SIGNED: [["move-in", "入居を記録", [["actual_move_in_date", "入居日", "optionalDate"]]], cancelLease],
     OCCUPIED: [["notice", "解約予告を記録", [
       ["termination_notice_date", "解約予告日", "optionalDate"], ["scheduled_move_out_date", "退去予定日", "date"],
       ["termination_reason", "解約理由", "optional"],
@@ -340,7 +341,7 @@ function formFields(resource, record, action) {
     if (!record) return true;
     if (resource === "fee-plans") return key !== "plan_version";
     if (resource === "management-contracts") return key !== "fee_plan_id"
-      && (record.status !== "ACTIVE" || !["owner_party_id", "start_date"].includes(key));
+      && (record.status !== "ACTIVE" || !["owner_party_id", "principal_party_id", "payee_party_id", "start_date"].includes(key));
     if (resource === "applications") return ["CONTRACTED", "WITHDRAWN", "REJECTED"].includes(record.status)
       ? ["external_procedure_status", "external_reference", "notes"].includes(key)
       : !["unit_id", "applicant_party_id"].includes(key);
@@ -358,7 +359,7 @@ function RentalForm({ apiBase, resource, record, action, preset, onSaved, onCanc
     ? { ...newDefaults.leases, lease_code: `LEASE-${record.id}` }
     : action ? Object.fromEntries(fields.filter(([key]) => record[key] != null).map(([key]) => [key, record[key]]))
       : record || { ...newDefaults[resource], ...preset });
-  const [assignments, setAssignments] = useState(() => (record?.units || []).map((row) => ({
+  const [assignments, setAssignments] = useState(() => (record?.units || []).filter((row) => !row.valid_to || row.valid_to >= row.valid_from).map((row) => ({
     key: row.id, unit_id: row.unit_id, valid_from: row.valid_from, valid_to: row.valid_to,
   })));
   const [failure, setFailure] = useState(null);
@@ -394,6 +395,7 @@ function RentalForm({ apiBase, resource, record, action, preset, onSaved, onCanc
 
   return <form className="panel rental-form" onSubmit={save}>
     <h2>{title}</h2>
+    {resource === "units" && <RecordValues row={values} fields={unitStates}/>}
     {action?.[0] === "create-lease" && <RecordValues row={record} fields={[
       ["desired_move_in_date", "契約開始日"], ["proposed_rent", "家賃", "money"], ["proposed_common_fee", "共益費", "money"],
     ]}/>}
@@ -449,7 +451,7 @@ function RecordDetail({ apiBase, resource, row, open, create }) {
   return <>
     <div className="panel">
       <h2>{resources[resource].name(row)}</h2>
-      <RecordValues row={row} fields={general}/>
+      <RecordValues row={row} fields={resource === "units" ? [...general, ...unitStates] : general}/>
       {row.notes && resource !== "applications" && <p>{row.notes}</p>}
     </div>
     {resource === "buildings" && <div className="panel">
@@ -484,7 +486,7 @@ function RecordDetail({ apiBase, resource, row, open, create }) {
       <h3>部屋の割当</h3>
       {row.units.length ? <ul>{row.units.map((item) => <li key={item.id}>
         <button type="button" className="secondary-btn" onClick={() => open("units", item.unit_id)}>{resources.units.name(item)}</button>
-        {" "}{item.valid_from} ～ {item.valid_to || "期限なし"}
+        {" "}{item.valid_to && item.valid_to < item.valid_from ? "有効期間なし" : `${item.valid_from} ～ ${item.valid_to || "期限なし"}`}
       </li>)}</ul> : <p>割当はありません。</p>}
       {row.termination_reason && <RecordValues row={row} fields={[["termination_reason", "終了理由"]]}/>}
     </div>}
@@ -502,7 +504,7 @@ function RecordDetail({ apiBase, resource, row, open, create }) {
       <div className="panel"><h3>契約履行記録</h3>
         <RecordValues row={row} fields={[
           ["signed_date", "署名日"], ["actual_move_in_date", "入居日"], ["termination_notice_date", "解約予告日"],
-          ["scheduled_move_out_date", "退去予定日"], ["actual_move_out_date", "退去日"], ["termination_reason", "解約理由"],
+          ["scheduled_move_out_date", "退去予定日"], ["actual_move_out_date", "退去日"], ["termination_reason", row.status === "CANCELLED" ? "取消理由" : "解約理由"],
         ]}/>
       </div>
       <div className="panel"><h3>外部手続き記録</h3>

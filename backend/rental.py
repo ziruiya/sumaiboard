@@ -585,13 +585,13 @@ def rental_summary(db, today):
                         AND (l.actual_move_out_date IS NULL OR l.actual_move_out_date > ?)
                   )), 0) AS occupied_units
            FROM units u
-           WHERE u.tenant_id=? AND u.management_status='MANAGED' AND EXISTS (
+           WHERE u.tenant_id=? AND EXISTS (
                SELECT 1 FROM management_contract_units cu
                JOIN management_contracts mc ON mc.tenant_id=cu.tenant_id AND mc.id=cu.management_contract_id
                WHERE cu.tenant_id=u.tenant_id AND cu.unit_id=u.id
                  AND cu.valid_from <= ? AND (cu.valid_to IS NULL OR cu.valid_to >= ?)
                  AND mc.start_date <= ? AND (mc.end_date IS NULL OR mc.end_date >= ?)
-                 AND mc.status IN ('ACTIVE', 'ENDED')
+                 AND mc.status IN ('ACTIVE','ENDED')
            )""",
         (today, today, TENANT_ID, today, today, today, today),
     ).fetchone()
@@ -658,8 +658,6 @@ def register_rental_routes(app, connect, require_actor, audit):
     occupancy_states = ("VACANT", "APPLYING", "CONTRACTING", "OCCUPIED", "TERMINATION_PENDING")
     choices = {
         "party_type": ("individual", "company"),
-        "management_status": ("MANAGED", "UNMANAGED"),
-        "occupancy_status": occupancy_states,
         "calculation_basis": ("CASH_COLLECTED",),
         "rounding_rule": ("FLOOR",),
         "acquisition_channel": ("OWN_SALE", "OTHER_PURCHASE", "INHERITANCE", "MANAGEMENT_TRANSFER", "OTHER"),
@@ -674,7 +672,7 @@ def register_rental_routes(app, connect, require_actor, audit):
     editable = {
         "parties": "party_type display_name name_kana postal_code address phone email contact_person remittance_destination_ref notes",
         "buildings": "building_code building_name postal_code address building_type structure_type construction_month floor_count management_start_date status notes",
-        "units": "building_id unit_number owner_party_id floor_number floor_area layout_type advertised_rent advertised_common_fee management_status occupancy_status notes",
+        "units": "building_id unit_number owner_party_id floor_number floor_area layout_type advertised_rent advertised_common_fee notes",
         "fee_plans": "plan_code plan_name rate calculation_basis included_charge_types tax_inclusive tax_rate vacancy_exempt rounding_rule minimum_fee effective_from effective_to",
         "management_contracts": "contract_code owner_party_id principal_party_id payee_party_id acquisition_channel accepted_date acquired_date start_date end_date previous_manager_name assigned_user_id remittance_day deposit_custodian notes",
         "management_contract_units": "unit_id valid_from valid_to",
@@ -688,13 +686,13 @@ def register_rental_routes(app, connect, require_actor, audit):
                     r"(?:\((\d+)(?:,(\d+))?\))?( NOT NULL)?(?=,|\s*$)", TABLE_DEFINITIONS[table], re.M)}
         for table in editable
     }
+    columns["leases"]["cancellation_reason"] = columns["leases"]["termination_reason"]
     amount_fields = {
         "advertised_rent", "advertised_common_fee", "minimum_fee", "proposed_rent",
         "proposed_common_fee", "rent_amount", "common_fee_amount", "deposit_amount", "key_money_amount",
     }
     defaults = {
         "buildings": {"status": "ACTIVE"},
-        "units": {"management_status": "UNMANAGED", "occupancy_status": "VACANT"},
         "fee_plans": {"calculation_basis": "CASH_COLLECTED", "rounding_rule": "FLOOR"},
         "applications": {"external_procedure_status": "NOT_STARTED_SAMPLE"},
         "leases": {"proration_rule": "ACTUAL_DAYS_FLOOR", "external_signature_status": "NOT_STARTED_SAMPLE"},
@@ -799,6 +797,26 @@ def register_rental_routes(app, connect, require_actor, audit):
             if values.get(key) is not None:
                 get(db, target, values[key])
 
+    def require_active_parties(db, table, values):
+        ids = {values[key] for key, target in RELATIONSHIPS[table].items()
+               if target == "parties" and values.get(key) is not None}
+        for party_id in sorted(ids):
+            if get(db, "parties", party_id, lock=True)["status"] != "ACTIVE":
+                invalid("有効な関係者を指定してください")
+
+    def check_party_inactivation(db, party_id):
+        references = (
+            ("management_contracts", "status='ACTIVE'",
+             ("owner_party_id", "principal_party_id", "payee_party_id"), "有効な管理契約"),
+            ("leases", "status NOT IN ('ENDED','CANCELLED')", ("tenant_party_id", "guarantor_party_id"), "未終了の賃貸借契約"),
+            ("applications", "status NOT IN ('CONTRACTED','REJECTED','WITHDRAWN')", ("applicant_party_id",), "未完了の入居申込"),
+        )
+        for table, status, columns, label in references:
+            parties = " OR ".join(f"{column}=?" for column in columns)
+            if db.execute(f"SELECT 1 FROM {table} WHERE tenant_id=? AND {status} AND ({parties}) LIMIT 1",
+                          (TENANT_ID, *([party_id] * len(columns)))).fetchone():
+                invalid(f"{label}に関連する関係者は無効化できません")
+
     def insert(db, actor, table, values):
         values = dict(values, tenant_id=TENANT_ID, created_by=actor.user_id, updated_by=actor.user_id)
         placeholders = ", ".join("?" for _ in values)
@@ -846,12 +864,16 @@ def register_rental_routes(app, connect, require_actor, audit):
             (TENANT_ID, contract_id),
         ).fetchall()
 
-    def check_assignments(db, contract, rows, previous=()):
-        unit_locks(db, [row["unit_id"] for row in [*rows, *previous]])
+    def assignment_has_period(row):
+        # A removed assignment that never took effect has an empty period.
+        return row.get("valid_to") is None or row["valid_from"] <= row["valid_to"]
+
+    def check_assignments(db, contract, rows):
         checked = {}
         for row in rows:
+            if not assignment_has_period(row):
+                continue
             start, end = row["valid_from"], row.get("valid_to")
-            ordered_dates(row, "valid_from", "valid_to")
             if start < contract["start_date"] or (
                 contract.get("end_date") and (start > contract["end_date"] or (end and end > contract["end_date"]))
             ):
@@ -861,46 +883,75 @@ def register_rental_routes(app, connect, require_actor, audit):
                 existing = db.execute(
                     """SELECT cu.valid_from, cu.valid_to, mc.end_date FROM management_contract_units cu
                        JOIN management_contracts mc ON mc.tenant_id=cu.tenant_id AND mc.id=cu.management_contract_id
-                       WHERE cu.tenant_id=? AND cu.unit_id=? AND mc.id<>? AND mc.status='ACTIVE'""",
+                       WHERE cu.tenant_id=? AND cu.unit_id=? AND mc.id<>?
+                         AND mc.status IN ('ACTIVE','ENDED')""",
                     (TENANT_ID, unit_id, contract.get("id", 0)),
                 ).fetchall()
-                checked[unit_id] = [(item["valid_from"], min(
-                    (day for day in (item["valid_to"], item["end_date"]) if day is not None), default=None
-                )) for item in existing]
+                # Older ended contracts may still have open assignment rows.
+                periods = [(item["valid_from"], item["valid_to"] or item["end_date"]) for item in existing]
+                checked[unit_id] = [(first, last) for first, last in periods if last is None or first <= last]
             effective_end = end or contract.get("end_date")
             if any(overlaps(start, effective_end, old_start, old_end) for old_start, old_end in checked[unit_id]):
                 conflict("同じ部屋の管理契約の有効期間が重複しています")
             checked[unit_id].append((start, effective_end))
 
+    def assignment_key(row):
+        return row["unit_id"], row["valid_from"]
+
+    def close_assignments(rows, cutoff, *, draft=False):
+        closed = []
+        for row in rows:
+            last = min(cutoff, row.get("valid_to") or cutoff)
+            if draft:
+                last = min(last, row["valid_from"] - timedelta(days=1))
+            closed.append(dict(row, valid_to=last))
+        return closed
+
     def save_assignments(db, actor, row_id, rows, previous):
-        old = {(row["unit_id"], row["valid_from"]): row for row in previous}
-        for values in rows:
-            values = dict(values, valid_to=values.get("valid_to"))
-            row = old.pop((values["unit_id"], values["valid_from"]), None)
-            if row is None:
+        old = {assignment_key(row): row for row in previous}
+        for row in rows:
+            values = {key: row.get(key) for key in ("unit_id", "valid_from", "valid_to")}
+            prior = old.get(assignment_key(row))
+            if prior is None:
                 assignment_id = insert(db, actor, "management_contract_units", dict(values, management_contract_id=row_id))
                 audit(db, actor.user_id, "rental.assignment.created", "management_contract_unit", assignment_id, f"管理契約 {row_id}")
-            elif row["valid_to"] != values["valid_to"]:
-                update(db, actor, "management_contract_units", row, {"valid_to": values["valid_to"]})
-                audit(db, actor.user_id, "rental.assignment.updated", "management_contract_unit", row["id"], f"管理契約 {row_id}")
-        for row in old.values():
-            db.execute("DELETE FROM management_contract_units WHERE tenant_id=? AND id=? AND version=?",
-                       (TENANT_ID, row["id"], row["version"]))
-            audit(db, actor.user_id, "rental.assignment.removed", "management_contract_unit", row["id"], f"管理契約 {row_id}")
+            elif prior["valid_to"] != values["valid_to"]:
+                update(db, actor, "management_contract_units", prior, {"valid_to": values["valid_to"]})
+                audit(db, actor.user_id, "rental.assignment.updated", "management_contract_unit", prior["id"], f"管理契約 {row_id}")
 
-    def plan_snapshots(db, plan_id):
-        plan = decode(get(db, "fee_plans", plan_id))
+    def refresh_management(db, actor, unit_ids, today):
+        for unit_id in sorted(set(unit_ids)):
+            unit = get(db, "units", unit_id)
+            active = db.execute(
+                """SELECT 1 FROM management_contract_units cu
+                   JOIN management_contracts mc ON mc.tenant_id=cu.tenant_id AND mc.id=cu.management_contract_id
+                   WHERE cu.tenant_id=? AND cu.unit_id=? AND mc.status IN ('ACTIVE','ENDED')
+                     AND cu.valid_from<=? AND (cu.valid_to IS NULL OR cu.valid_to>=?)
+                     AND mc.start_date<=? AND (mc.end_date IS NULL OR mc.end_date>=?) LIMIT 1""",
+                (TENANT_ID, unit_id, today, today, today, today),
+            ).fetchone()
+            status = "MANAGED" if active else "UNMANAGED"
+            if unit["management_status"] != status:
+                update(db, actor, "units", unit, {"management_status": status})
+
+    def plan_snapshots(db, plan_id, start):
+        plan = decode(get(db, "fee_plans", plan_id, lock=True))
         if plan["status"] != "ACTIVE":
             invalid("有効な管理料プランを選んでください")
+        if start < plan["effective_from"] or (plan["effective_to"] and start > plan["effective_to"]):
+            invalid("管理契約の開始日が管理料プランの適用期間外です")
         snapshot = {key: str(plan[key]) if isinstance(plan[key], Decimal) else plan[key] for key in snapshot_fields}
         rules = db.execute(
             """SELECT id, charge_code, beneficiary_type, tax_category, refundable, recurring, settlement_eligible
                FROM charge_types WHERE tenant_id=? AND status='ACTIVE' ORDER BY id""", (TENANT_ID,),
         ).fetchall()
+        charge_rules = {rule.pop("charge_code"): decode(rule) for rule in rules}
+        if "BROKERAGE" in charge_rules:
+            charge_rules["BROKERAGE"]["settlement_deduction_allowed"] = False
         return {
             "fee_plan_id": plan_id, "fee_plan_version": plan["plan_version"],
             "fee_plan_snapshot": json.dumps(snapshot),
-            "charge_rule_snapshot": json.dumps({rule.pop("charge_code"): decode(rule) for rule in rules}),
+            "charge_rule_snapshot": json.dumps(charge_rules),
         }
 
     def validate_business(db, table, values):
@@ -914,33 +965,35 @@ def register_rental_routes(app, connect, require_actor, audit):
         if table == "management_contracts":
             ordered_dates(values, "start_date", "end_date")
         if table == "leases":
-            ordered_dates(values, "start_date", "scheduled_end_date")
-
-    def lease_period(lease):
-        start = min(lease["start_date"], lease.get("actual_move_in_date") or lease["start_date"])
-        actual_end = lease.get("actual_move_out_date")
-        if actual_end is not None:
-            return start, actual_end - timedelta(days=1)
-        return start, lease.get("scheduled_move_out_date") or lease.get("scheduled_end_date")
+            for first, last in (
+                ("start_date", "scheduled_end_date"), ("signed_date", "actual_move_in_date"),
+                ("actual_move_in_date", "actual_move_out_date"),
+                ("actual_move_in_date", "termination_notice_date"),
+                ("termination_notice_date", "scheduled_move_out_date"),
+                ("termination_notice_date", "actual_move_out_date"),
+            ):
+                ordered_dates(values, first, last)
 
     def check_lease_period(db, lease):
-        start, end = lease_period(lease)
-        if end is not None and end < start:
-            return
         rows = db.execute(
-            """SELECT * FROM leases WHERE tenant_id=? AND unit_id=? AND id<>?
-               AND status IN ('SIGNED','OCCUPIED','TERMINATION_PENDING','ENDED')""",
+            """SELECT start_date, scheduled_end_date, status, actual_move_in_date, actual_move_out_date
+               FROM leases WHERE tenant_id=? AND unit_id=? AND id<>?
+                 AND status IN ('SIGNED','OCCUPIED','TERMINATION_PENDING')""",
             (TENANT_ID, lease["unit_id"], lease.get("id", 0)),
         ).fetchall()
         for other in rows:
-            other_start, other_end = lease_period(other)
-            if (other_end is None or other_end >= other_start) and overlaps(start, end, other_start, other_end):
+            other_start, other_end = other["start_date"], other["scheduled_end_date"]
+            if other["status"] != "SIGNED":
+                other_end = other["actual_move_out_date"]
+                if other_end is not None:
+                    other_start = other["actual_move_in_date"] or other_start
+            if overlaps(lease["start_date"], lease.get("scheduled_end_date"), other_start, other_end):
                 conflict("同じ部屋の賃貸借契約期間が重複しています")
 
     def refresh_occupancy(db, actor, unit_id):
         unit = get(db, "units", unit_id)
         leases = db.execute(
-            "SELECT status FROM leases WHERE tenant_id=? AND unit_id=? AND status<>'ENDED'",
+            "SELECT status FROM leases WHERE tenant_id=? AND unit_id=? AND status NOT IN ('ENDED','CANCELLED')",
             (TENANT_ID, unit_id),
         ).fetchall()
         applications = db.execute(
@@ -980,11 +1033,12 @@ def register_rental_routes(app, connect, require_actor, audit):
                    WHERE cu.tenant_id=? AND cu.unit_id=? AND mc.status IN ('ACTIVE','ENDED')
                      AND cu.valid_from<=? AND (cu.valid_to IS NULL OR cu.valid_to>=?)
                      AND mc.start_date<=? AND (mc.end_date IS NULL OR mc.end_date>=?)
-                   ORDER BY mc.status='ACTIVE' DESC, cu.valid_from DESC, mc.id DESC LIMIT 1""",
+                   ORDER BY cu.valid_from DESC, mc.id DESC LIMIT 1""",
                 (TENANT_ID, row_id, today, today, today, today),
             ).fetchone()
             row["building_name"] = get(db, "buildings", row["building_id"])["building_name"]
             row["current_management_contract"] = decode(contract) if contract else None
+            row["management_status"] = "MANAGED" if contract else "UNMANAGED"
             row["current_lease"] = db.execute(
                 """SELECT * FROM leases WHERE tenant_id=? AND unit_id=?
                    AND status IN ('SIGNED','OCCUPIED','TERMINATION_PENDING')
@@ -1031,6 +1085,8 @@ def register_rental_routes(app, connect, require_actor, audit):
         rows = None
         if table == "parties":
             extra = {"party_code": uuid.uuid4().hex, "status": "ACTIVE"}
+        elif table == "units":
+            extra = {"management_status": "UNMANAGED", "occupancy_status": "VACANT"}
         elif table == "fee_plans":
             extra = dict(fields(table, {"plan_version": payload.pop("plan_version", 1)}, ("plan_version",)),
                          status="DRAFT")
@@ -1040,7 +1096,7 @@ def register_rental_routes(app, connect, require_actor, audit):
             cutoff = payload.pop("settlement_cutoff_day", 31)
             if type(cutoff) is not int or cutoff != 31:
                 invalid("精算締め日は月末固定です")
-            extra = dict(plan_snapshots(db, plan["fee_plan_id"]), settlement_cutoff_day=31, status="DRAFT")
+            extra = dict(plan, settlement_cutoff_day=31, status="DRAFT")
         elif table == "applications":
             payload.setdefault("assigned_user_id", actor.user_id)
             extra = {"status": "RECEIVED", "screening_result": "PENDING"}
@@ -1056,9 +1112,12 @@ def register_rental_routes(app, connect, require_actor, audit):
         validate_refs(db, table, values)
         validate_business(db, table, values)
         if rows is not None:
+            unit_locks(db, [item["unit_id"] for item in rows])
+            values.update(plan_snapshots(db, values["fee_plan_id"], values["start_date"]))
             check_assignments(db, values, rows)
         if table in {"applications", "leases"}:
             unit_locks(db, [values["unit_id"]])
+            require_active_parties(db, table, values)
         if table == "leases":
             check_lease_period(db, values)
         row_id = insert(db, actor, table, values)
@@ -1075,8 +1134,13 @@ def register_rental_routes(app, connect, require_actor, audit):
     def parse_assignments(raw):
         if not isinstance(raw, list) or len(raw) > 100 or any(not isinstance(row, dict) for row in raw):
             invalid("部屋割当は100件以内で指定してください")
-        return [fields("management_contract_units", row, editable["management_contract_units"].split(), create=True)
+        rows = [fields("management_contract_units", row, editable["management_contract_units"].split(), create=True)
                 for row in raw]
+        if len({assignment_key(row) for row in rows}) != len(rows):
+            conflict("同じ部屋と開始日の割当が重複しています")
+        for row in rows:
+            ordered_dates(row, "valid_from", "valid_to")
+        return rows
 
     def edit_record(db, actor, table, row_id, payload):
         if table in {"applications", "leases"}:
@@ -1090,7 +1154,7 @@ def register_rental_routes(app, connect, require_actor, audit):
         if table == "management_contracts" and row["status"] in {"ENDED", "CANCELLED"}:
             invalid("終了または取消済みの管理契約は変更できません")
         if table == "management_contracts" and row["status"] == "ACTIVE":
-            allowed = [key for key in allowed if key not in {"owner_party_id", "start_date"}]
+            allowed = [key for key in allowed if key not in {"owner_party_id", "principal_party_id", "payee_party_id", "start_date"}]
         if table == "applications":
             allowed = [key for key in allowed if key not in {"unit_id", "applicant_party_id"}]
             if row["status"] in {"CONTRACTED", "REJECTED", "WITHDRAWN"}:
@@ -1104,19 +1168,40 @@ def register_rental_routes(app, connect, require_actor, audit):
         values = fields(table, payload, allowed)
         if not values and rows is None:
             invalid("更新項目を入力してください")
-        validate_refs(db, table, values)
         merged = row | values
+        if table == "units" and merged["owner_party_id"] != row["owner_party_id"]:
+            for related in ("management_contract_units", "applications", "leases", "complaints",
+                            "work_orders", "inspections", "settlement_lines"):
+                if db.execute(f"SELECT 1 FROM {related} WHERE tenant_id=? AND unit_id=? LIMIT 1",
+                              (TENANT_ID, row_id)).fetchone():
+                    invalid("業務履歴のある部屋の所有権変更は、旧管理契約の終了と新管理契約の作成で行ってください")
+        validate_refs(db, table, values)
         validate_business(db, table, merged)
+        affected = []
+        today = datetime.now(JST).date()
         if table == "management_contracts":
             previous = assignments(db, row_id)
-            check_assignments(db, merged, previous if rows is None else rows, previous)
-            if rows is not None:
+            affected = [item["unit_id"] for item in [*previous, *(rows or [])]]
+            unit_locks(db, affected)
+            if rows is None:
+                check_assignments(db, merged, previous)
+            else:
+                keys = {assignment_key(item) for item in rows}
+                omitted = [item for item in previous if assignment_key(item) not in keys]
+                cutoff = today - timedelta(days=1)
+                if row["end_date"]:
+                    cutoff = min(cutoff, row["end_date"])
+                rows.extend(close_assignments(omitted, cutoff, draft=row["status"] == "DRAFT"))
+                check_assignments(db, merged, rows)
                 save_assignments(db, actor, row_id, rows, previous)
                 # Assignment-only edits also advance the contract version.
                 values.setdefault("end_date", row["end_date"])
         if table == "leases" and row["status"] == "DRAFT":
+            require_active_parties(db, table, merged)
             check_lease_period(db, merged)
         update(db, actor, table, row, values)
+        if affected and (rows is not None or "end_date" in values):
+            refresh_management(db, actor, affected, today)
         audit(db, actor.user_id, f"rental.{table}.updated", table, row_id, "更新")
         return detail(db, table, row_id)
 
@@ -1139,6 +1224,7 @@ def register_rental_routes(app, connect, require_actor, audit):
         },
         "leases": {
             "sign": (("DRAFT",), "SIGNED", ("signed_date",)),
+            "cancel": (("DRAFT", "SIGNED"), "CANCELLED", ("cancellation_reason",)),
             "move-in": (("SIGNED",), "OCCUPIED", ("actual_move_in_date",)),
             "notice": (("OCCUPIED",), "TERMINATION_PENDING",
                        ("termination_notice_date", "scheduled_move_out_date", "termination_reason")),
@@ -1161,12 +1247,14 @@ def register_rental_routes(app, connect, require_actor, audit):
         for key in ("signed_date", "actual_move_in_date", "termination_notice_date", "actual_move_out_date"):
             if key in values and (values[key] is None or values[key] > today):
                 invalid(f"実績日は本日以前の日付を指定してください（{key}）")
-        for first, last in (
-            ("signed_date", "actual_move_in_date"), ("actual_move_in_date", "termination_notice_date"),
-            ("termination_notice_date", "scheduled_move_out_date"), ("termination_notice_date", "actual_move_out_date"),
-            ("actual_move_in_date", "scheduled_end_date"), ("start_date", "actual_move_out_date"),
-        ):
-            ordered_dates(merged, first, last)
+        validate_business(db, "leases", merged)
+        if action == "sign":
+            require_active_parties(db, "leases", row)
+            check_lease_period(db, merged)
+        if action == "cancel":
+            if not values.get("cancellation_reason"):
+                invalid("賃貸借契約の取消理由を入力してください")
+            values["termination_reason"] = values.pop("cancellation_reason")
         if action == "move-in":
             occupied = db.execute(
                 """SELECT id FROM leases WHERE tenant_id=? AND unit_id=? AND id<>?
@@ -1175,7 +1263,6 @@ def register_rental_routes(app, connect, require_actor, audit):
             ).fetchone()
             if occupied:
                 conflict("同じ部屋に退去前の賃貸借契約があります")
-        check_lease_period(db, merged)
 
     def transition_record(db, actor, table, row_id, action, payload):
         if table in {"applications", "leases"}:
@@ -1188,18 +1275,24 @@ def register_rental_routes(app, connect, require_actor, audit):
             invalid(f"現在の状態（{row['status']}）から指定の操作はできません（{target}）")
         values = fields(table, payload, allowed)
         today = datetime.now(JST).date()
+        if table == "parties":
+            check_party_inactivation(db, row_id)
         if table == "management_contracts":
             rows = assignments(db, row_id)
+            affected = [item["unit_id"] for item in rows]
+            unit_locks(db, affected)
             if action == "activate":
-                if not rows:
+                if not any(assignment_has_period(item) for item in rows):
                     invalid("有効化には部屋の割当が必要です")
                 check_assignments(db, row, rows)
+                require_active_parties(db, table, row)
+                values.update(plan_snapshots(db, row["fee_plan_id"], row["start_date"]))
             elif action == "end":
                 if not values.get("termination_reason"):
                     invalid("契約の終了理由を入力してください")
                 values["end_date"] = values.get("end_date") or row["end_date"] or today
                 ordered_dates(row | values, "start_date", "end_date")
-                unit_locks(db, [item["unit_id"] for item in rows])
+                save_assignments(db, actor, row_id, close_assignments(rows, values["end_date"]), rows)
         if table == "applications":
             if action in {"reject", "withdraw"} and not values.get("cancellation_reason"):
                 invalid("却下または取下げの理由を入力してください")
@@ -1208,6 +1301,8 @@ def register_rental_routes(app, connect, require_actor, audit):
         if table == "leases":
             lease_transition(db, row, action, values, today)
         update(db, actor, table, row, dict(values, status=target))
+        if table == "management_contracts" and action in {"activate", "end"}:
+            refresh_management(db, actor, affected, today)
         if table in {"applications", "leases"}:
             refresh_occupancy(db, actor, row["unit_id"])
         audit(db, actor.user_id, f"rental.{table}.{action}", table, row_id, f"{row['status']} → {target}")
@@ -1247,8 +1342,16 @@ def register_rental_routes(app, connect, require_actor, audit):
                 "EXISTS (SELECT 1 FROM management_contracts mc WHERE mc.tenant_id=t.tenant_id AND mc.owner_party_id=t.id)"
             )
         select, join = "t.*", ""
+        select_args = ()
         if table == "units":
-            select += ", b.building_name"
+            select += """, b.building_name, EXISTS (
+                SELECT 1 FROM management_contract_units cu JOIN management_contracts mc
+                  ON mc.tenant_id=cu.tenant_id AND mc.id=cu.management_contract_id
+                WHERE cu.tenant_id=t.tenant_id AND cu.unit_id=t.id AND mc.status IN ('ACTIVE','ENDED')
+                  AND cu.valid_from<=? AND (cu.valid_to IS NULL OR cu.valid_to>=?)
+                  AND mc.start_date<=? AND (mc.end_date IS NULL OR mc.end_date>=?)
+            ) AS currently_managed"""
+            select_args = (datetime.now(JST).date(),) * 4
             join = "JOIN buildings b ON b.tenant_id=t.tenant_id AND b.id=t.building_id"
             for column, value in (("building_id", building_id), ("occupancy_status", occupancy_status)):
                 if value is not None:
@@ -1268,8 +1371,11 @@ def register_rental_routes(app, connect, require_actor, audit):
                 get(db, "buildings", building_id)
             rows = db.execute(
                 f"SELECT {select} FROM {table} t {join} WHERE {' AND '.join(filters)} ORDER BY t.id LIMIT ? OFFSET ?",
-                (*args, limit, offset),
+                (*select_args, *args, limit, offset),
             ).fetchall()
+            if table == "units":
+                for row in rows:
+                    row["management_status"] = "MANAGED" if row.pop("currently_managed") else "UNMANAGED"
             return [decode(row) for row in rows]
 
     @router.get("/staff", dependencies=[Depends(require_staff)])
