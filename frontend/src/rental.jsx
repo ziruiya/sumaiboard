@@ -73,7 +73,7 @@ function RentalDashboard({ apiBase }) {
   </>}</RentalResult>;
 }
 
-export default function RentalPage({ page, apiBase }) {
+export default function RentalPage({ page, apiBase, accountRole, userId }) {
   const title = rentalPages.find(([id]) => id === page)?.[1];
   if (!title) return null;
   return <section className="rental-page">
@@ -83,7 +83,7 @@ export default function RentalPage({ page, apiBase }) {
         : page === "applications" ? <RentalPipeline apiBase={apiBase}/>
           : page === "rent" ? <RentalRent apiBase={apiBase}/>
             : page === "repairs" ? <RentalRepairs apiBase={apiBase}/>
-            : page === "settlements" ? <RentalSettlements apiBase={apiBase}/>
+            : page === "settlements" ? <RentalSettlements apiBase={apiBase} accountRole={accountRole} userId={userId}/>
               : page === "funds" ? <RentalFunds apiBase={apiBase}/>
               : <p className="panel">準備中</p>}
   </section>;
@@ -1041,7 +1041,12 @@ function SettlementSource({ apiBase, source, back, openSettlement }) {
   </div>;
 }
 
-function SettlementDetails({ apiBase, id, back, openSettlement, onChange }) {
+const settlementFinanceRoles = ["finance", "executive", "administrator"];
+const settlementApprovalRoles = ["executive", "store_manager", "administrator"];
+
+function SettlementDetails({ apiBase, id, back, openSettlement, onChange, accountRole, userId }) {
+  const canFinance = settlementFinanceRoles.includes(accountRole);
+  const canApprove = settlementApprovalRoles.includes(accountRole);
   const result = useRentalData(apiBase, `settlements/${id}`);
   const action = useMoneyAction(apiBase);
   const [source, setSource] = useState(null);
@@ -1065,6 +1070,7 @@ function SettlementDetails({ apiBase, id, back, openSettlement, onChange }) {
     <RentalResult result={result}>{(row) => {
       const remitted = row.remittances.find((item) => item.status === "SIMULATED_REMITTED");
       const pending = row.remittances.find((item) => item.status === "SCHEDULED");
+      const { carry_in: carryIn, carry_out: carryOut } = row.calculation_snapshot;
       return <>
         <div className="panel">
           <h2>{row.contract_code} · {row.settlement_month.slice(0, 7)}</h2>
@@ -1077,10 +1083,24 @@ function SettlementDetails({ apiBase, id, back, openSettlement, onChange }) {
               ["adjustment_amount", "調整（正は控除）", "money"], ["payable_amount", "模擬送金予定額", "money"],
               ["actual", "模擬送金実績", "money"], ["closing_available_balance", "期末残高", "money"],
             ]}/>
-          <div className="rental-controls">{(settlementActions[row.status] || []).map(([operation, label]) =>
+          <div className="rental-controls">{(settlementActions[row.status] || [])
+            .filter(([operation]) => ["approve", "reject"].includes(operation)
+              ? canApprove && row.submitted_by !== userId : canFinance)
+            .map(([operation, label]) =>
             <button key={operation} type="button" className="secondary-btn" disabled={action.busy}
               onClick={() => submit(operation, { version: row.version })}>{label}</button>)}</div>
         </div>
+        {(carryIn || carryOut) && <div className="panel rental-stack">
+          <h3>模擬送金の繰越</h3>
+          {carryIn && <div>
+            前回からの繰越 {yen.format(carryIn.amount)}　
+            <button type="button" className="secondary-btn" onClick={() => openSettlement(carryIn.settlement_id)}>繰越元の精算</button>
+          </div>}
+          {carryOut && <div>
+            当初予定額 {yen.format(carryOut.original_scheduled_amount)} · 繰越額 {yen.format(carryOut.amount)}　
+            <button type="button" className="secondary-btn" onClick={() => openSettlement(carryOut.settlement_id)}>繰越先の精算</button>
+          </div>}
+        </div>}
         <h3>精算明細</h3>
         <MoneyList rows={row.lines} empty="明細がありません。" render={(line) => {
           const linked = ["payment_allocation", "work_order", "settlement_line"].includes(line.source_type);
@@ -1096,25 +1116,25 @@ function SettlementDetails({ apiBase, id, back, openSettlement, onChange }) {
           empty="繰越未控除はありません。" render={(item) => <MoneyRow title={item.description}
             description={item.source_month.slice(0, 7)} balance={yen.format(item.amount)}
             onClick={item.source_type === "work_order" ? () => setSource({ type: item.source_type, id: item.source_id }) : undefined}/>}/>
-        {row.status === "DRAFT" && <form className="panel rental-stack" onSubmit={(event) => {
+        {canFinance && row.status === "DRAFT" && <form className="panel rental-stack" onSubmit={(event) => {
           event.preventDefault();
           const form = new FormData(event.currentTarget);
           const original = form.get("original");
           submit("adjustments", { version: row.version, amount: Number(form.get("amount")), description: form.get("description"),
-            ...(original ? { adjustment_of_id: Number(original) } : {}) });
+            adjustment_of_id: Number(original) });
         }}>
           <h3>調整を追加</h3>
-          <label>調整額（円、正は控除）<input name="amount" type="number" step="1" required/></label>
+          <label>調整額（円、収納の訂正は正、控除の訂正は負）<input name="amount" type="number" step="1" required/></label>
           <label>理由<input name="description" required maxLength={255}/></label>
-          <label>訂正元の精算明細 ID（任意）<input name="original" type="number" min="1"/></label>
+          <label>訂正元の精算明細 ID<input name="original" type="number" min="1" required/></label>
           <button className="secondary-btn" disabled={action.busy}>調整を登録</button>
         </form>}
         <h3>模擬送金</h3>
         <MoneyList rows={row.remittances} empty="模擬送金の記録はありません。" render={(item) =>
-          <MoneyRow title={`模擬送金 · ${remittanceStatuses[item.status]}`}
+          <MoneyRow title={`模擬送金 · ${item.failure_reason === "後続の精算へ繰越" ? "失効（繰越）" : remittanceStatuses[item.status]}`}
             description={`予定日 ${item.scheduled_date}${item.remitted_date ? ` · 実行日 ${item.remitted_date}` : ""}`}
             balance={yen.format(item.actual_amount ?? item.scheduled_amount)}/>}/>
-        {row.status === "FINALIZED" && !remitted && <form className="panel rental-stack" onSubmit={(event) => {
+        {canFinance && row.status === "FINALIZED" && !remitted && !carryOut && <form className="panel rental-stack" onSubmit={(event) => {
           event.preventDefault();
           submit("remit", { version: row.version, scheduled_date: pending?.scheduled_date ?? scheduled });
         }}>
@@ -1133,7 +1153,40 @@ function SettlementDetails({ apiBase, id, back, openSettlement, onChange }) {
   </div>;
 }
 
-function RentalSettlements({ apiBase }) {
+function RentalPeriod({ apiBase, month, accountRole, userId }) {
+  const result = useRentalData(apiBase, `periods/${month}`);
+  const action = useMoneyAction(apiBase);
+  const canPrepare = settlementFinanceRoles.includes(accountRole);
+  const canClose = canPrepare || settlementApprovalRoles.includes(accountRole);
+  const labels = { OPEN: "未締め", PREPARED: "準備済み", CLOSED: "締め済み",
+    REOPEN_REQUESTED: "締め済み", REOPENED: "未締め" };
+  return <section className="panel rental-stack">
+    <h2>賃貸月次締め</h2>
+    <MoneyError action={action} refresh={result.retry}/>
+    <RentalResult result={result}>{(row) => <>
+      <p>{labels[row.status]}</p>
+      {row.snapshot && <dl>{Object.entries({
+        charges: "請求", payments: "入金", allocations: "消込", settlements: "精算",
+      }).map(([key, label]) => <div key={key}>
+        <dt>{label}</dt><dd>{number.format(row.snapshot[key].count)} 件 · {yen.format(row.snapshot[key].amount)}</dd>
+      </div>)}</dl>}
+      <div className="rental-controls">
+        {canPrepare && ["OPEN", "PREPARED", "REOPENED"].includes(row.status) &&
+          <button type="button" className="secondary-btn" disabled={action.busy}
+            onClick={() => action.submit(`periods/${month}/prepare`, undefined, result.retry)}>
+            {row.status === "PREPARED" ? "締めを再準備" : "締めを準備"}
+          </button>}
+        {canClose && row.status === "PREPARED" && row.snapshot && row.prepared_by !== userId &&
+          <button type="button" className="primary-btn" disabled={action.busy}
+            onClick={() => action.submit(`periods/${month}/close`, undefined, result.retry)}>締めを確定</button>}
+        {row.status === "PREPARED" && row.snapshot && row.prepared_by === userId && <small>別のユーザーによる確定待ち</small>}
+      </div>
+    </>}</RentalResult>
+  </section>;
+}
+
+function RentalSettlements({ apiBase, accountRole, userId }) {
+  const canFinance = settlementFinanceRoles.includes(accountRole);
   const [month, setMonth] = useState(todayJst().slice(0, 7));
   const [contract, setContract] = useState(null);
   const [offset, setOffset] = useState(0);
@@ -1141,7 +1194,7 @@ function RentalSettlements({ apiBase }) {
   const data = useRentalData(apiBase, `settlements?month=${month}&offset=${offset}`);
   const action = useMoneyAction(apiBase);
   if (id) return <SettlementDetails key={id} apiBase={apiBase} id={id} back={() => setId(null)}
-    openSettlement={setId} onChange={data.retry}/>;
+    openSettlement={setId} onChange={data.retry} accountRole={accountRole} userId={userId}/>;
   return <div className="rental-stack">
     <form className="panel rental-stack" onSubmit={(event) => {
       event.preventDefault();
@@ -1154,10 +1207,13 @@ function RentalSettlements({ apiBase }) {
         setMonth(event.target.value);
         setOffset(0);
       }}/></label>
-      <ReferenceField apiBase={apiBase} label="生成する管理契約" resource="management-contracts"
-        value={contract} setValue={setContract}/>
-      <button className="primary-btn" disabled={action.busy}>精算を生成</button>
+      {canFinance && <>
+        <ReferenceField apiBase={apiBase} label="生成する管理契約" resource="management-contracts"
+          value={contract} setValue={setContract}/>
+        <button className="primary-btn" disabled={action.busy || !contract}>精算を生成</button>
+      </>}
     </form>
+    {month && <RentalPeriod key={month} apiBase={apiBase} month={month} accountRole={accountRole} userId={userId}/>}
     <MoneyError action={action} refresh={data.retry}/>
     {month && <RentalResult result={data}>{(rows) => <>
       <MoneyList rows={rows} empty="この月の精算はありません。" render={(row) => <MoneyRow title={row.contract_code}
@@ -1191,7 +1247,7 @@ function RentalFunds({ apiBase }) {
       unallocated: "未消込", deposit: "敷金", owner_allocation: "オーナー費目消込",
       settlement_fee_escrow: "管理料（預り金口座 OUT）", settlement_fee_company: "管理料（自社資金口座 IN）",
       settlement_repair: "修繕控除（預り金口座 OUT）", settlement_adjustment: "精算調整（預り金口座）",
-      settlement_remittance: "模擬送金（預り金口座 OUT）",
+      settlement_remittance: "模擬送金（預り金口座 OUT）", settlement_adjustment_company: "精算調整（自社資金口座）",
     };
     const selected = data.business_reconciliation.find((row) => String(row.management_contract_id) === contract);
     const differences = data.business_reconciliation.flatMap((row) =>
