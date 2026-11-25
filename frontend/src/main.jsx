@@ -842,6 +842,7 @@ function App() {
     }
     if (identity.account_role === "hr") setPage("accounts");
     else if (identity.account_role === "owner") setPage("owner-portal");
+    else if (identity.environment?.public_sample) setPreferences(identity.preferences);
     else {
       const preferencesResponse = await fetch(`${API_BASE}/api/preferences`, { credentials: "include" });
       if (!preferencesResponse.ok) throw new Error("preferences access denied");

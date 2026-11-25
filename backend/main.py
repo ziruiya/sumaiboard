@@ -11,6 +11,7 @@ import secrets
 import time
 import unicodedata
 import uuid
+from collections import OrderedDict, deque
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -570,6 +571,43 @@ def public_sample_mode_enabled():
 SAMPLE_GUEST_EMPLOYEE_CODE = os.getenv("SAMPLE_GUEST_EMPLOYEE_CODE", "EX-01")
 SAMPLE_BLOCK_MESSAGE = "公開サンプルではこの操作はできません（表示データはすべて架空で、毎日自動リセットされます）"
 
+def sample_or_demo_enabled():
+    return demo_mode_enabled() or public_sample_mode_enabled()
+
+
+# Public sample API classification. Exact method/path pairs cover shell reads,
+# authentication, reset and shared infrastructure. Only rental is a prefix.
+# Every other API route (including legacy business APIs and admin writes) is 410.
+_SAMPLE_EXACT = {
+    "GET": {
+        "/api/health", "/api/public-config", "/api/bootstrap", "/api/auth/demo-accounts",
+        "/api/notifications", "/api/calendar", "/api/bulletin", "/api/audit-events",
+        "/api/system-config", "/api/accounts", "/api/operations/status",
+        "/api/month-closes", "/api/month-closes/lock-matrix",
+    },
+    "POST": {
+        "/api/auth/login", "/api/auth/logout", "/api/auth/demo-login", "/api/auth/guest-login",
+        "/api/reset", "/api/calendar",
+    },
+    "PUT": {"/api/preferences"},
+}
+_SAMPLE_PARAMETERIZED = {
+    "GET": re.compile(r"/api/audit-events/[^/]+"),
+    "PUT": re.compile(r"/api/(?:notifications/[^/]+/(?:read|archive)|calendar/[^/]+)"),
+}
+_SAMPLE_WRITES = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def sample_route_allowed(method, raw_path):
+    path = raw_path.removesuffix("/")
+    pattern = _SAMPLE_PARAMETERIZED.get(method)
+    return (
+        raw_path.startswith("/api/rental/")
+        or path in _SAMPLE_EXACT.get(method, ())
+        or (pattern is not None and pattern.fullmatch(path) is not None)
+    )
+
+
 _SAMPLE_BLOCKED = [
     ({"POST", "PUT", "PATCH", "DELETE"}, r"^/api/bulletin(/.*)?$"),
     ({"POST"}, r"^/api/expenses$"),
@@ -598,7 +636,7 @@ _SAMPLE_NEUTRALIZE = [
     ("POST", r"^/api/activities$", {"body": "サンプル活動メモ",
                                     "next_action": lambda v: "フォローアップ" if v else v}),
     ("POST", r"^/api/calendar$", {"title": "サンプル予定"}),
-    ("PUT", r"^/api/calendar/\d+$", {"title": "サンプル予定"}),
+    ("PUT", r"^/api/calendar/[^/]+$", {"title": "サンプル予定"}),
     ("POST", r"^/api/introductions/\d+/referral-consent$", {"evidence_reference": "サンプル確認済"}),
     ("PUT", r"^/api/report$", {"manual_note": ""}),
     ("POST", r"^/api/expenses/\d+/(approve|reject)$", {"reason": None}),
@@ -606,66 +644,90 @@ _SAMPLE_NEUTRALIZE = [
 
 
 class SampleGuardMiddleware:
-    """Public-sample guard, active only when PUBLIC_SAMPLE_MODE=true.
-
-    Blocks write endpoints whose payload is free text or whose effect is
-    administrative/destructive (bulletin posts and comments, expense
-    creation, disputes, data corrections, month-close, system config,
-    account management, imports, export jobs, password operations and the
-    demo reset). On a small set of structured demo flows it replaces
-    free-text fields with canned sample values, so visitors can add and
-    modify records with selects, numbers and dates only. The scheduled
-    on-box reset job is exempted for POST /api/reset when it presents the
-    SAMPLE_RESET_TOKEN header; the token lives only in the server .env.
-    """
+    """Serialize demo resets and apply the public-sample API guards."""
 
     def __init__(self, app):
         self.app = app
         self.resetting = False
+        self.reset_failed = False
         self.active_requests = 0
         self.idle = asyncio.Event()
         self.idle.set()
+        self.write_windows = OrderedDict()
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or not public_sample_mode_enabled():
+        if scope["type"] != "http" or not sample_or_demo_enabled():
             await self.app(scope, receive, send)
             return
-        method = scope.get("method", "")
-        path = scope.get("path", "")
-        if path.startswith(rental.LEGACY_SAMPLE_PREFIXES):
+        method = scope["method"]
+        raw_path = scope["path"]
+        if not raw_path.startswith("/api/"):
+            await self.app(scope, receive, send)
+            return
+        path = raw_path.removesuffix("/")
+        public_sample = public_sample_mode_enabled()
+        if self.reset_failed:
+            await JSONResponse({"detail": "サンプルデータのリセットに失敗しました"},
+                               status_code=503)(scope, receive, send)
+            return
+        if public_sample and not sample_route_allowed(method, raw_path):
             await JSONResponse({"detail": SAMPLE_BLOCK_MESSAGE}, status_code=410)(scope, receive, send)
-            return
-        if not path.startswith("/api/"):
-            await self.app(scope, receive, send)
             return
         if self.resetting:
             await JSONResponse({"detail": "サンプルデータをリセット中です"}, status_code=409)(scope, receive, send)
             return
-        if path.rstrip("/") == "/api/reset" and method == "POST":
-            headers = {k.lower(): v for k, v in scope.get("headers") or []}
-            presented = headers.get(b"x-sample-reset-token", b"").decode("utf-8", "ignore")
-            expected = os.getenv("SAMPLE_RESET_TOKEN", "")
-            if presented and expected and hmac.compare_digest(presented, expected):
-                self.resetting = True
-                try:
-                    await self.idle.wait()
-                    await self.app(scope, receive, send)
-                finally:
+        if path == "/api/reset" and method == "POST":
+            if public_sample:
+                presented = Request(scope).headers.get("x-sample-reset-token", "")
+                expected = os.getenv("SAMPLE_RESET_TOKEN", "")
+                if not presented or not expected or not hmac.compare_digest(presented.encode(), expected.encode()):
+                    await JSONResponse({"detail": SAMPLE_BLOCK_MESSAGE}, status_code=422)(scope, receive, send)
+                    return
+            scope.setdefault("state", {})["sample_guard"] = self
+            self.resetting = True
+            try:
+                await self.idle.wait()
+                await self.app(scope, receive, send)
+            finally:
+                if not self.reset_failed:
                     self.resetting = False
-                return
-            await JSONResponse({"detail": SAMPLE_BLOCK_MESSAGE}, status_code=422)(scope, receive, send)
             return
+        if public_sample and method in _SAMPLE_WRITES and not path.startswith("/api/auth/"):
+            if not self.allow_write(Request(scope)):
+                await JSONResponse({"detail": "書き込み回数の上限に達しました"},
+                                   status_code=429)(scope, receive, send)
+                return
         self.active_requests += 1
         self.idle.clear()
         try:
-            await self.guard_request(scope, receive, send, method, path)
+            if public_sample:
+                await self.guard_request(scope, receive, send, method, path)
+            else:
+                await self.app(scope, receive, send)
         finally:
             self.active_requests -= 1
             if not self.active_requests:
                 self.idle.set()
 
+    def allow_write(self, request):
+        now = time.monotonic()
+        cutoff = now - 60
+        # Windows are ordered by their most recent accepted write.
+        while self.write_windows and next(iter(self.write_windows.values()))[-1] <= cutoff:
+            self.write_windows.popitem(last=False)
+        token = request.cookies.get(SESSION_COOKIE)
+        key = ("session", token) if token else ("ip", request.client.host if request.client else None)
+        window = self.write_windows.setdefault(key, deque())
+        while window and window[0] <= cutoff:
+            window.popleft()
+        if len(window) >= 60:
+            return False
+        window.append(now)
+        self.write_windows.move_to_end(key)
+        return True
+
     async def guard_request(self, scope, receive, send, method, path):
-        if method not in ("POST", "PUT", "PATCH", "DELETE"):
+        if method not in _SAMPLE_WRITES:
             await self.app(scope, receive, send)
             return
         for methods, pattern in _SAMPLE_BLOCKED:
@@ -1240,7 +1302,7 @@ class ChangePasswordInput(BaseModel):
 
 @app.get("/api/auth/demo-accounts")
 def demo_accounts(request: Request):
-    if not demo_mode_enabled():
+    if not sample_or_demo_enabled():
         with connect() as db:
             audit(db, None, "demo.login.disabled", "security", None,
                   json.dumps({"source_ip": request.client.host if request.client else None,
@@ -1260,7 +1322,7 @@ def demo_accounts(request: Request):
 
 @app.post("/api/auth/demo-login")
 def demo_login(payload: DemoLoginInput, request: Request, response: Response):
-    if not demo_mode_enabled():
+    if not sample_or_demo_enabled():
         with connect() as db:
             audit(db, None, "demo.login.disabled", "security", None,
                   json.dumps({"source_ip": request.client.host if request.client else None,
@@ -1987,7 +2049,8 @@ def seed(db):
     ensure_system_config(db)
     ensure_demo_accounts(db)
     rental.ensure_rental_schema(db)
-    rental.seed_rental(db)
+    if sample_or_demo_enabled():
+        rental.seed_rental(db)
 
 
 def _seed_legacy(db):
@@ -2652,7 +2715,7 @@ def bootstrap(x_demo_role: CurrentActor = Depends(require_actor)):
             {"id": "advisor", "name": "顧問"}, {"id": "finance", "name": "財務"},
             {"id": "hr", "name": "人事"}, {"id": "owner", "name": "オーナー"},
         ]
-        return {
+        identity = {
             "user": {"id": user["id"], "public_id": user["public_id"],
                      "employee_code": user["employee_code"], "name": user["display_name"],
                      "role": user["role"], "store_id": user["store_id"],
@@ -2675,6 +2738,13 @@ def bootstrap(x_demo_role: CurrentActor = Depends(require_actor)):
             "environment": {"demo": demo_mode_enabled(),
                             "public_sample": public_sample_mode_enabled()},
         }
+        if public_sample_mode_enabled():
+            identity.update(
+                households=[], introductions=[], contracts=[], construction=[],
+                fees=[], entitlements=[],
+                preferences=read_preferences(db, user["id"], role),
+            )
+        return identity
 
 
 @app.get("/api/households")
@@ -3297,17 +3367,21 @@ def create_management_report(payload: ManagementReportInput,
     )
 
 
+def read_preferences(db, user_id, role):
+    row = db.execute("SELECT * FROM user_preferences WHERE user_id=?", (user_id,)).fetchone()
+    return {
+        "dashboard_widgets": json.loads(row["dashboard_widgets"]) if row else (
+            ["tasks", "report"] if role == "advisor" else ["tasks", "overview", "trend"]
+        ),
+        "notification_preferences": json.loads(row["notification_preferences"]) if row else {"in_app": True, "email": False},
+    }
+
+
 @app.get("/api/preferences")
 def get_preferences(x_demo_role: CurrentActor = Depends(require_actor)):
     with connect() as db:
         user = request_user(db, x_demo_role)
-        row = db.execute("SELECT * FROM user_preferences WHERE user_id=?", (user["id"],)).fetchone()
-        return {
-            "dashboard_widgets": json.loads(row["dashboard_widgets"]) if row else (
-                ["tasks", "report"] if x_demo_role == "advisor" else ["tasks", "overview", "trend"]
-            ),
-            "notification_preferences": json.loads(row["notification_preferences"]) if row else {"in_app": True, "email": False},
-        }
+        return read_preferences(db, user["id"], x_demo_role)
 
 
 class PreferencesInput(BaseModel):
@@ -4947,35 +5021,54 @@ def save_report(payload: ReportInput, x_demo_role: CurrentActor = Depends(requir
     return {"ok": True}
 
 
-@app.post("/api/reset")
+def require_reset_mode():
+    if not sample_or_demo_enabled():
+        raise HTTPException(403, "デモモードは無効です")
+
+
+@app.post("/api/reset", dependencies=[Depends(require_reset_mode)])
 def reset_demo(request: Request, x_demo_role: CurrentActor = Depends(require_actor)):
     role_guard(x_demo_role, ("hq_finance",))
-    referral_storage_keys = []
+    guard = request.state.sample_guard
     with connect() as db:
         rental.check_rental_reset_scope(db)
-        session_token = request.cookies.get(SESSION_COOKIE)
-        if public_sample_mode_enabled():
-            db.execute("DELETE FROM auth_sessions")
-        elif session_token:
-            db.execute("DELETE FROM auth_sessions WHERE token_hash<>?", (token_digest(session_token),))
-        db.execute("DELETE FROM password_reset_tokens")
-        db.execute("DELETE FROM auth_login_attempts")
-        db.execute("DELETE FROM password_history")
-        db.execute("DELETE FROM notification_deliveries")
-        db.execute("DELETE FROM notifications")
-        audit(db, x_demo_role.user_id, "DEMO_DATA_RESET", "seed", None, f"batch={SEED_BATCH}")
         referral_storage_keys = [
             row["storage_key"] for row in db.execute(
                 "SELECT storage_key FROM referral_document_files"
             ).fetchall()
         ]
-        for table in TABLES:
-            db.execute(f"DROP TABLE IF EXISTS `{table}`")
-        seed(db)
-    for storage_key in referral_storage_keys:
-        if Path(storage_key).name == storage_key:
-            (REFERRAL_STORAGE_DIR / storage_key).unlink(missing_ok=True)
-    return {"ok": True}
+
+    # MySQL commits DDL implicitly. Rebuild from scratch on a fresh
+    # connection if an earlier attempt failed partway through.
+    for attempt in range(2):
+        try:
+            with connect() as db:
+                session_token = request.cookies.get(SESSION_COOKIE)
+                if public_sample_mode_enabled():
+                    db.execute("DELETE FROM auth_sessions")
+                elif session_token:
+                    db.execute("DELETE FROM auth_sessions WHERE token_hash<>?", (token_digest(session_token),))
+                db.execute("DELETE FROM password_reset_tokens")
+                db.execute("DELETE FROM auth_login_attempts")
+                db.execute("DELETE FROM password_history")
+                db.execute("DELETE FROM notification_deliveries")
+                db.execute("DELETE FROM notifications")
+                if attempt == 0:
+                    audit(db, x_demo_role.user_id, "DEMO_DATA_RESET", "seed", None, f"batch={SEED_BATCH}")
+                for table in TABLES:
+                    db.execute(f"DROP TABLE IF EXISTS `{table}`")
+                for storage_key in referral_storage_keys:
+                    if Path(storage_key).name == storage_key:
+                        (REFERRAL_STORAGE_DIR / storage_key).unlink(missing_ok=True)
+                seed(db)
+        except Exception:
+            logging.exception("Demo reset attempt %d failed", attempt + 1)
+            if attempt == 1:
+                guard.reset_failed = True
+                raise HTTPException(500, "サンプルデータのリセットに失敗しました")
+        else:
+            guard.reset_failed = False
+            return {"ok": True}
 
 
 @app.get("/api/notifications")

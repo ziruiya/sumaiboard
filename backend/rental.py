@@ -10,33 +10,26 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 TENANT_ID = 1
 JST = ZoneInfo("Asia/Tokyo")
-LEGACY_SAMPLE_PREFIXES = (
-    "/api/households", "/api/introductions", "/api/partners", "/api/referral-",
-    "/api/construction", "/api/fee-", "/api/stage", "/api/negotiations", "/api/contracts",
-    "/api/activities", "/api/negotiation-queue", "/api/consents", "/api/entitlements",
-    "/api/data-corrections", "/api/dashboard/summary", "/api/dashboard/trends",
-    "/api/management/overview", "/api/management/reports", "/api/report",
-)
 
 # Tables are declared in dependency order so reset can drop them in reverse order.
 TABLE_DEFINITIONS = {
     "parties": """
         party_code VARCHAR(40) NOT NULL, party_type VARCHAR(24) NOT NULL,
-        display_name VARCHAR(120) NOT NULL, name_kana VARCHAR(120), postal_code VARCHAR(20),
-        address VARCHAR(255), phone VARCHAR(50), email VARCHAR(255), contact_person VARCHAR(120),
+        display_name VARCHAR(200) NOT NULL, name_kana VARCHAR(200), postal_code VARCHAR(20),
+        address VARCHAR(500), phone VARCHAR(50), email VARCHAR(255), contact_person VARCHAR(120),
         remittance_destination_ref VARCHAR(120), status VARCHAR(24) NOT NULL, notes TEXT,
         UNIQUE (tenant_id, party_code)
     """,
     "buildings": """
-        building_code VARCHAR(40) NOT NULL, building_name VARCHAR(120) NOT NULL,
-        postal_code VARCHAR(20), address VARCHAR(255) NOT NULL, building_type VARCHAR(40) NOT NULL,
+        building_code VARCHAR(40) NOT NULL, building_name VARCHAR(200) NOT NULL,
+        postal_code VARCHAR(20), address VARCHAR(500) NOT NULL, building_type VARCHAR(40) NOT NULL,
         structure_type VARCHAR(40), construction_month DATE, floor_count INT,
         management_start_date DATE, status VARCHAR(24) NOT NULL, notes TEXT,
         UNIQUE (tenant_id, building_code)
     """,
     "units": """
-        building_id BIGINT NOT NULL, unit_number VARCHAR(24) NOT NULL, owner_party_id BIGINT NOT NULL,
-        floor_number INT, floor_area DECIMAL(8,2), layout_type VARCHAR(24),
+        building_id BIGINT NOT NULL, unit_number VARCHAR(32) NOT NULL, owner_party_id BIGINT NOT NULL,
+        floor_number INT, floor_area DECIMAL(8,2), layout_type VARCHAR(32),
         advertised_rent BIGINT NOT NULL, advertised_common_fee BIGINT NOT NULL,
         management_status VARCHAR(24) NOT NULL, occupancy_status VARCHAR(24) NOT NULL, notes TEXT,
         UNIQUE (tenant_id, building_id, unit_number)
@@ -53,7 +46,7 @@ TABLE_DEFINITIONS = {
         contract_code VARCHAR(40) NOT NULL, owner_party_id BIGINT NOT NULL,
         principal_party_id BIGINT NOT NULL, payee_party_id BIGINT NOT NULL,
         acquisition_channel VARCHAR(32) NOT NULL, accepted_date DATE NOT NULL, acquired_date DATE,
-        start_date DATE NOT NULL, end_date DATE, previous_manager_name VARCHAR(120),
+        start_date DATE NOT NULL, end_date DATE, previous_manager_name VARCHAR(200),
         assigned_user_id INT NOT NULL, fee_plan_id BIGINT NOT NULL, fee_plan_version INT NOT NULL,
         fee_plan_snapshot JSON NOT NULL, charge_rule_snapshot JSON NOT NULL,
         settlement_cutoff_day TINYINT NOT NULL, remittance_day TINYINT NOT NULL,
@@ -111,7 +104,7 @@ TABLE_DEFINITIONS = {
     """,
     "payments": """
         payment_code VARCHAR(40) NOT NULL, received_date DATE NOT NULL, amount BIGINT NOT NULL,
-        payer_name VARCHAR(120) NOT NULL, payer_party_id BIGINT, payment_source VARCHAR(32) NOT NULL,
+        payer_name VARCHAR(200) NOT NULL, payer_party_id BIGINT, payment_source VARCHAR(32) NOT NULL,
         fund_account_id BIGINT NOT NULL, management_contract_id BIGINT,
         external_reference VARCHAR(120), idempotency_key VARCHAR(120) NOT NULL,
         status VARCHAR(24) NOT NULL, notes TEXT,
@@ -254,8 +247,48 @@ RENTAL_SCHEMA = "\n".join(_create_table(table, columns) for table, columns in TA
 RENTAL_RESET_TABLES = tuple(reversed(TABLE_DEFINITIONS))
 
 
+# Reset recreates the tables at the current width and keeps schema history.
+# CREATE IF NOT EXISTS also restores tables during reset and interrupted setup.
+_RENTAL_V2_COLUMNS = {
+    "parties": {"display_name": (200, "NOT NULL"), "name_kana": (200, "NULL"), "address": (500, "NULL")},
+    "buildings": {"building_name": (200, "NOT NULL"), "address": (500, "NOT NULL")},
+    "units": {"unit_number": (32, "NOT NULL"), "layout_type": (32, "NULL")},
+    "management_contracts": {"previous_manager_name": (200, "NULL")},
+    "payments": {"payer_name": (200, "NOT NULL")},
+}
+
+
+def widen_rental_columns(db):
+    for table, columns in _RENTAL_V2_COLUMNS.items():
+        widths = {
+            row["COLUMN_NAME"]: row["CHARACTER_MAXIMUM_LENGTH"]
+            for row in db.execute(
+                """SELECT COLUMN_NAME, CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS
+                   WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=?""", (table,),
+            )
+        }
+        changes = [
+            f"MODIFY COLUMN `{column}` VARCHAR({width}) {nullable}"
+            for column, (width, nullable) in columns.items() if widths[column] < width
+        ]
+        if changes:
+            db.execute(f"ALTER TABLE `{table}` " + ", ".join(changes))
+
+
 def ensure_rental_schema(db):
     db.executescript(RENTAL_SCHEMA)
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS rental_schema_migrations (
+            version INT PRIMARY KEY, applied_at DATETIME NOT NULL
+        ) ENGINE=InnoDB"""
+    )
+    applied = {row["version"] for row in db.execute("SELECT version FROM rental_schema_migrations")}
+    for version, migrate in ((1, None), (2, widen_rental_columns)):
+        if version in applied:
+            continue
+        if migrate:
+            migrate(db)
+        db.execute("INSERT INTO rental_schema_migrations VALUES (?, UTC_TIMESTAMP())", (version,))
 
 
 def check_rental_reset_scope(db):
@@ -471,6 +504,8 @@ def seed_rental(db):
 
     for index, status in enumerate(("RECEIVED", "SCREENING", "APPROVED"), start=1):
         unit_id, rent, common_fee = vacant[index - 1]
+        db.execute("UPDATE units SET occupancy_status=? WHERE tenant_id=? AND id=?",
+                   ("CONTRACTING" if status == "APPROVED" else "APPLYING", TENANT_ID, unit_id))
         applicant_id = party(f"APP-PARTY-{index}", f"サンプル申込者 {index}")
         insert("applications", application_code=f"APP-{index:02}", unit_id=unit_id,
                applicant_party_id=applicant_id, application_date=month, application_channel="SAMPLE",
@@ -478,8 +513,8 @@ def seed_rental(db):
                screening_result="APPROVED" if status == "APPROVED" else "PENDING",
                external_procedure_status="NOT_STARTED_SAMPLE", assigned_user_id=staff_id, status=status)
 
-    # 19 complaints, 15 work orders (including F03), and six inspections.
-    for index in range(19):
+    # 25 complaints, 15 work orders (including F03), and six inspections.
+    for index in range(25):
         building_id, unit_id, _, tenant = occupied[index * 7]
         received = datetime.combine(history[index % 12], datetime.min.time())
         closed = index % 3 == 2
@@ -494,7 +529,10 @@ def seed_rental(db):
         building_id, unit_id, contract_id, _ = occupied[index * 11]
         received = month if index == 0 else history[(index - 1) % 12]
         inspected = index < 6
-        status = "INSPECTED" if inspected else ("RECEIVED", "ESTIMATED", "APPROVED")[index % 3]
+        if index == 0:
+            status = "COST_CONFIRMED"
+        else:
+            status = "INSPECTED" if inspected else ("RECEIVED", "ESTIMATED", "APPROVED")[index % 3]
         amount = 12000 if index == 0 else rng.randrange(8, 30) * 1000
         approved = inspected or status == "APPROVED"
         work_order_id = insert(

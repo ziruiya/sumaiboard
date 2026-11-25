@@ -55,12 +55,12 @@ function RentalDashboard({ apiBase }) {
     <p className="muted">集計月 {data.service_month.slice(0, 7)}</p>
     <div className="rental-metrics">
       {[
-        ["未収額", yen.format(data.outstanding_amount)],
+        ["当月請求分未収額", yen.format(data.outstanding_amount)],
         ["未消込入金", `${number.format(data.unallocated_payment_count)} 件`],
         ["緊急苦情", `${number.format(data.urgent_complaint_count)} 件`],
         ["精算承認待ち", `${number.format(data.pending_settlement_approval_count)} 件`],
-        ["請求額", yen.format(data.billed_amount)],
-        ["消込額", yen.format(data.allocated_amount)],
+        ["当月請求額", yen.format(data.billed_amount)],
+        ["当月請求分消込額", yen.format(data.allocated_amount)],
         ["物件数", `${number.format(data.building_count)} 棟`],
         ["部屋数", `${number.format(data.unit_count)} 室`],
         ["入居率", percent.format(data.occupancy_rate)],
