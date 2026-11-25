@@ -6423,7 +6423,7 @@ def health():
     return {"status": "ok"}
 
 
-rental.register_rental_routes(app, connect, require_actor)
+rental.register_rental_routes(app, connect, require_actor, audit)
 
 DIST = ROOT / "frontend" / "dist"
 if DIST.exists():

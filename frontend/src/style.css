@@ -782,3 +782,126 @@
 .rental-metric strong {
   font-size: 1.55rem;
 }
+
+.rental-stack, .rental-form {
+  display: grid;
+  gap: 0.85rem;
+  min-width: 0;
+}
+
+.rental-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.rental-controls [aria-pressed="true"] {
+  border-color: currentColor;
+  font-weight: 700;
+}
+
+.rental-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.rental-list li + li {
+  border-top: 1px solid #e2e8f0;
+}
+
+.rental-list-button {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem 1rem;
+  padding: 0.8rem 1rem;
+  width: 100%;
+  text-align: start;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+.rental-list-button:hover {
+  background: #f1f5f9;
+}
+
+.rental-list-button small {
+  display: block;
+}
+
+.rental-room-grid, .rental-fields, .rental-values {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
+  gap: 0.75rem;
+}
+
+.rental-room-grid {
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 7rem), 1fr));
+}
+
+.rental-room {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.7rem;
+  cursor: pointer;
+  border: 1px solid #94a3b8;
+  border-radius: 0.5rem;
+  color: #0f172a;
+  background: #f1f5f9;
+}
+
+.rental-room[data-state="OCCUPIED"] { background: #dcfce7; border-color: #4ade80; }
+.rental-room[data-state="APPLYING"] { background: #fef3c7; border-color: #f59e0b; }
+.rental-room[data-state="CONTRACTING"] { background: #dbeafe; border-color: #60a5fa; }
+.rental-room[data-state="TERMINATION_PENDING"] { background: #ffe4e6; border-color: #fb7185; }
+
+.rental-fields label {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.rental-fields :is(select, input, textarea) {
+  width: 100%;
+  min-width: 0;
+}
+
+.rental-form fieldset {
+  min-width: 0;
+  border: 1px solid #cbd5e1;
+  border-radius: 0.5rem;
+}
+
+.rental-fields .rental-check {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.rental-check input {
+  width: auto;
+}
+
+.rental-assignment {
+  margin-block: 0.6rem;
+  align-items: end;
+}
+
+.rental-values dt {
+  color: #475569;
+  font-size: 0.875rem;
+}
+
+.rental-values dd {
+  margin: 0.2rem 0 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.rental-error { color: #9f1239; }
+.rental-error button { margin-inline-start: 0.5rem; }
+.rental-disclaimer { margin: 0; }

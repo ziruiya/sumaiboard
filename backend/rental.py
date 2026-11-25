@@ -1,12 +1,15 @@
-"""Batch A rental schema, sample data, and read-only dashboard endpoints."""
+"""Rental schema, sample data, and staff workflows."""
 
 import json
 import random
+import re
 import uuid
 from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pymysql.err import IntegrityError, OperationalError
 
 TENANT_ID = 1
 JST = ZoneInfo("Asia/Tokyo")
@@ -633,7 +636,7 @@ def rental_summary(db, today):
 router = APIRouter(prefix="/api/rental")
 
 
-def register_rental_routes(app, connect, require_actor):
+def register_rental_routes(app, connect, require_actor, audit):
     def require_staff(actor=Depends(require_actor)):
         if actor.account_role not in {
             "executive", "administrator", "hq_staff", "store_manager", "advisor", "finance",
@@ -646,24 +649,684 @@ def register_rental_routes(app, connect, require_actor):
         with connect() as db:
             return rental_summary(db, datetime.now(JST).date())
 
-    @router.get("/buildings", dependencies=[Depends(require_staff)])
-    def buildings(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
+    snapshot_fields = (
+        "plan_code", "plan_version", "rate", "calculation_basis", "tax_inclusive",
+        "tax_rate", "vacancy_exempt", "rounding_rule", "minimum_fee", "included_charge_types",
+    )
+    json_fields = {"included_charge_types", "fee_plan_snapshot", "charge_rule_snapshot"}
+    boolean_fields = {"tax_inclusive", "vacancy_exempt", "refundable", "recurring", "settlement_eligible"}
+    occupancy_states = ("VACANT", "APPLYING", "CONTRACTING", "OCCUPIED", "TERMINATION_PENDING")
+    choices = {
+        "party_type": ("individual", "company"),
+        "management_status": ("MANAGED", "UNMANAGED"),
+        "occupancy_status": occupancy_states,
+        "calculation_basis": ("CASH_COLLECTED",),
+        "rounding_rule": ("FLOOR",),
+        "acquisition_channel": ("OWN_SALE", "OTHER_PURCHASE", "INHERITANCE", "MANAGEMENT_TRANSFER", "OTHER"),
+        "deposit_custodian": ("COMPANY", "OWNER", "OTHER"),
+        "proration_rule": ("ACTUAL_DAYS_FLOOR",),
+        "screening_result": ("PENDING", "APPROVED", "REJECTED"),
+    }
+    for field in ("external_signature_status", "external_procedure_status"):
+        choices[field] = ("NOT_STARTED_SAMPLE", "IN_PROGRESS_SAMPLE", "RECORDED_SAMPLE")
+
+    # Editable fields are explicit. Column metadata keeps validation within the existing schema bounds.
+    editable = {
+        "parties": "party_type display_name name_kana postal_code address phone email contact_person remittance_destination_ref notes",
+        "buildings": "building_code building_name postal_code address building_type structure_type construction_month floor_count management_start_date status notes",
+        "units": "building_id unit_number owner_party_id floor_number floor_area layout_type advertised_rent advertised_common_fee management_status occupancy_status notes",
+        "fee_plans": "plan_code plan_name rate calculation_basis included_charge_types tax_inclusive tax_rate vacancy_exempt rounding_rule minimum_fee effective_from effective_to",
+        "management_contracts": "contract_code owner_party_id principal_party_id payee_party_id acquisition_channel accepted_date acquired_date start_date end_date previous_manager_name assigned_user_id remittance_day deposit_custodian notes",
+        "management_contract_units": "unit_id valid_from valid_to",
+        "applications": "application_code unit_id applicant_party_id application_date application_channel desired_move_in_date proposed_rent proposed_common_fee external_procedure_status external_reference assigned_user_id notes",
+        "leases": "lease_code unit_id tenant_party_id guarantor_party_id contract_type start_date scheduled_end_date rent_amount common_fee_amount deposit_amount key_money_amount payment_due_day proration_rule external_signature_status",
+    }
+    columns = {
+        table: {match[1]: (match[2], match[3], match[4], bool(match[5]))
+                for match in re.finditer(
+                    r"(\w+) (BIGINT|INT|TINYINT|DATE|VARCHAR|TEXT|DECIMAL|BOOLEAN|JSON)"
+                    r"(?:\((\d+)(?:,(\d+))?\))?( NOT NULL)?(?=,|\s*$)", TABLE_DEFINITIONS[table], re.M)}
+        for table in editable
+    }
+    amount_fields = {
+        "advertised_rent", "advertised_common_fee", "minimum_fee", "proposed_rent",
+        "proposed_common_fee", "rent_amount", "common_fee_amount", "deposit_amount", "key_money_amount",
+    }
+    defaults = {
+        "buildings": {"status": "ACTIVE"},
+        "units": {"management_status": "UNMANAGED", "occupancy_status": "VACANT"},
+        "fee_plans": {"calculation_basis": "CASH_COLLECTED", "rounding_rule": "FLOOR"},
+        "applications": {"external_procedure_status": "NOT_STARTED_SAMPLE"},
+        "leases": {"proration_rule": "ACTUAL_DAYS_FLOOR", "external_signature_status": "NOT_STARTED_SAMPLE"},
+    }
+
+    def invalid(message):
+        raise HTTPException(422, message)
+
+    def conflict(message):
+        raise HTTPException(409, message)
+
+    def fields(table, payload, allowed, *, create=False):
+        unknown = payload.keys() - set(allowed)
+        if unknown:
+            invalid(f"指定・変更できない項目です（{', '.join(sorted(unknown))}）")
+        values = {}
+        for key in allowed:
+            kind, precision, scale, required = columns[table][key]
+            if key not in payload:
+                if create and required:
+                    invalid(f"必須項目を入力してください（{key}）")
+                continue
+            value = payload[key]
+            if value is None and not required:
+                values[key] = None
+                continue
+            valid = True
+            if kind in {"BIGINT", "INT", "TINYINT"}:
+                bits = {"BIGINT": 64, "INT": 32, "TINYINT": 8}[kind]
+                valid = type(value) is int and -(2 ** (bits - 1)) <= value < 2 ** (bits - 1)
+                if valid and (key.endswith("_id") or key in amount_fields):
+                    valid = value >= (1 if key.endswith("_id") else 0)
+                if valid and key in {"payment_due_day", "remittance_day"}:
+                    valid = 1 <= value <= 31
+                if valid and key in {"plan_version", "floor_count"}:
+                    valid = value >= 1
+            elif kind in {"VARCHAR", "TEXT"}:
+                valid = isinstance(value, str) and len(value) <= int(precision or 16000)
+                if valid:
+                    value = value.strip()
+                    valid = bool(value) or not required
+            elif kind == "BOOLEAN":
+                valid = type(value) is bool
+            elif kind == "DATE":
+                try:
+                    valid = isinstance(value, str) and bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", value))
+                    if valid:
+                        value = date.fromisoformat(value)
+                        valid = value.year >= 1000
+                except ValueError:
+                    valid = False
+            elif kind == "DECIMAL":
+                try:
+                    value = Decimal(str(value))
+                    valid = (value.is_finite() and 0 <= value < 10 ** (int(precision) - int(scale))
+                             and value == round(value, int(scale))
+                             and (key == "floor_area" or value <= 1))
+                except (InvalidOperation, ValueError, OverflowError):
+                    valid = False
+            elif kind == "JSON":
+                valid = (isinstance(value, list) and 0 < len(value) <= 100
+                         and all(isinstance(code, str) and len(code) <= 40 for code in value)
+                         and len(value) == len(set(value)))
+                if valid:
+                    value = json.dumps(value)
+            if not valid or (key in choices and value not in choices[key]):
+                if key == "calculation_basis":
+                    invalid("計算基準には実収納基準（CASH_COLLECTED）を指定してください")
+                invalid(f"入力値が正しくありません（{key}）")
+            if table == "buildings" and key == "status" and value not in {"ACTIVE", "INACTIVE"}:
+                invalid("建物の状態が正しくありません")
+            values[key] = value
+        return values
+
+    def decode(row):
+        for key in row.keys() & json_fields:
+            if isinstance(row[key], (str, bytes)):
+                row[key] = json.loads(row[key])
+        for key in row.keys() & boolean_fields:
+            row[key] = bool(row[key])
+        return row
+
+    def get(db, table, row_id, *, lock=False):
+        suffix = " FOR UPDATE" if lock else ""
+        if table == "users":
+            # Platform identities are global. Only active staff can be assigned rental work.
+            row = db.execute(
+                "SELECT id FROM users WHERE id=? AND account_status='ACTIVE' AND role IN "
+                "('executive','administrator','hq_staff','store_manager','advisor','finance')",
+                (row_id,),
+            ).fetchone()
+        else:
+            row = db.execute(
+                f"SELECT * FROM {table} WHERE tenant_id=? AND id=?{suffix}", (TENANT_ID, row_id),
+            ).fetchone()
+        if row is None:
+            raise HTTPException(404, "指定されたデータが見つかりません")
+        return row
+
+    def validate_refs(db, table, values):
+        for key, target in RELATIONSHIPS.get(table, {}).items():
+            if values.get(key) is not None:
+                get(db, target, values[key])
+
+    def insert(db, actor, table, values):
+        values = dict(values, tenant_id=TENANT_ID, created_by=actor.user_id, updated_by=actor.user_id)
+        placeholders = ", ".join("?" for _ in values)
+        return db.execute(
+            f"INSERT INTO {table} ({', '.join(values)}) VALUES ({placeholders})", tuple(values.values()),
+        ).lastrowid
+
+    def update(db, actor, table, row, values):
+        if not values:
+            return
+        assignments = ", ".join(f"{key}=?" for key in values)
+        result = db.execute(
+            f"""UPDATE {table} SET {assignments}, updated_by=?, updated_at=UTC_TIMESTAMP(6),
+                version=version+1 WHERE tenant_id=? AND id=? AND version=?""",
+            (*values.values(), actor.user_id, TENANT_ID, row["id"], row["version"]),
+        )
+        if result.rowcount != 1:
+            conflict("他の操作で更新されました。最新のデータを読み込んでください")
+
+    def check_version(payload, row):
+        version = payload.pop("version", None)
+        if type(version) is not int or version < 1:
+            invalid("更新には version が必要です")
+        if version != row["version"]:
+            conflict("他の操作で更新されました。最新のデータを読み込んでください")
+
+    def ordered_dates(values, first, last):
+        if values.get(first) is not None and values.get(last) is not None and values[first] > values[last]:
+            invalid(f"終了日は開始日以降にしてください（{first}, {last}）")
+
+    def overlaps(start, end, other_start, other_end):
+        return (end is None or other_start <= end) and (other_end is None or start <= other_end)
+
+    def unit_locks(db, ids):
+        for unit_id in sorted(set(ids)):
+            get(db, "units", unit_id, lock=True)
+
+    def assignments(db, contract_id):
+        return db.execute(
+            """SELECT cu.*, u.unit_number, u.building_id, b.building_name
+               FROM management_contract_units cu
+               JOIN units u ON u.tenant_id=cu.tenant_id AND u.id=cu.unit_id
+               JOIN buildings b ON b.tenant_id=u.tenant_id AND b.id=u.building_id
+               WHERE cu.tenant_id=? AND cu.management_contract_id=? ORDER BY cu.valid_from, cu.id""",
+            (TENANT_ID, contract_id),
+        ).fetchall()
+
+    def check_assignments(db, contract, rows, previous=()):
+        unit_locks(db, [row["unit_id"] for row in [*rows, *previous]])
+        checked = {}
+        for row in rows:
+            start, end = row["valid_from"], row.get("valid_to")
+            ordered_dates(row, "valid_from", "valid_to")
+            if start < contract["start_date"] or (
+                contract.get("end_date") and (start > contract["end_date"] or (end and end > contract["end_date"]))
+            ):
+                invalid("部屋の割当期間は管理契約期間内にしてください")
+            unit_id = row["unit_id"]
+            if unit_id not in checked:
+                existing = db.execute(
+                    """SELECT cu.valid_from, cu.valid_to, mc.end_date FROM management_contract_units cu
+                       JOIN management_contracts mc ON mc.tenant_id=cu.tenant_id AND mc.id=cu.management_contract_id
+                       WHERE cu.tenant_id=? AND cu.unit_id=? AND mc.id<>? AND mc.status='ACTIVE'""",
+                    (TENANT_ID, unit_id, contract.get("id", 0)),
+                ).fetchall()
+                checked[unit_id] = [(item["valid_from"], min(
+                    (day for day in (item["valid_to"], item["end_date"]) if day is not None), default=None
+                )) for item in existing]
+            effective_end = end or contract.get("end_date")
+            if any(overlaps(start, effective_end, old_start, old_end) for old_start, old_end in checked[unit_id]):
+                conflict("同じ部屋の管理契約の有効期間が重複しています")
+            checked[unit_id].append((start, effective_end))
+
+    def save_assignments(db, actor, row_id, rows, previous):
+        old = {(row["unit_id"], row["valid_from"]): row for row in previous}
+        for values in rows:
+            values = dict(values, valid_to=values.get("valid_to"))
+            row = old.pop((values["unit_id"], values["valid_from"]), None)
+            if row is None:
+                assignment_id = insert(db, actor, "management_contract_units", dict(values, management_contract_id=row_id))
+                audit(db, actor.user_id, "rental.assignment.created", "management_contract_unit", assignment_id, f"管理契約 {row_id}")
+            elif row["valid_to"] != values["valid_to"]:
+                update(db, actor, "management_contract_units", row, {"valid_to": values["valid_to"]})
+                audit(db, actor.user_id, "rental.assignment.updated", "management_contract_unit", row["id"], f"管理契約 {row_id}")
+        for row in old.values():
+            db.execute("DELETE FROM management_contract_units WHERE tenant_id=? AND id=? AND version=?",
+                       (TENANT_ID, row["id"], row["version"]))
+            audit(db, actor.user_id, "rental.assignment.removed", "management_contract_unit", row["id"], f"管理契約 {row_id}")
+
+    def plan_snapshots(db, plan_id):
+        plan = decode(get(db, "fee_plans", plan_id))
+        if plan["status"] != "ACTIVE":
+            invalid("有効な管理料プランを選んでください")
+        snapshot = {key: str(plan[key]) if isinstance(plan[key], Decimal) else plan[key] for key in snapshot_fields}
+        rules = db.execute(
+            """SELECT id, charge_code, beneficiary_type, tax_category, refundable, recurring, settlement_eligible
+               FROM charge_types WHERE tenant_id=? AND status='ACTIVE' ORDER BY id""", (TENANT_ID,),
+        ).fetchall()
+        return {
+            "fee_plan_id": plan_id, "fee_plan_version": plan["plan_version"],
+            "fee_plan_snapshot": json.dumps(snapshot),
+            "charge_rule_snapshot": json.dumps({rule.pop("charge_code"): decode(rule) for rule in rules}),
+        }
+
+    def validate_business(db, table, values):
+        if table == "fee_plans":
+            ordered_dates(values, "effective_from", "effective_to")
+            if "included_charge_types" in values:
+                codes = json.loads(values["included_charge_types"])
+                existing = db.execute("SELECT charge_code FROM charge_types WHERE tenant_id=?", (TENANT_ID,)).fetchall()
+                if not set(codes) <= {row["charge_code"] for row in existing}:
+                    invalid("存在しない対象費目が指定されています")
+        if table == "management_contracts":
+            ordered_dates(values, "start_date", "end_date")
+        if table == "leases":
+            ordered_dates(values, "start_date", "scheduled_end_date")
+
+    def lease_period(lease):
+        start = min(lease["start_date"], lease.get("actual_move_in_date") or lease["start_date"])
+        actual_end = lease.get("actual_move_out_date")
+        if actual_end is not None:
+            return start, actual_end - timedelta(days=1)
+        return start, lease.get("scheduled_move_out_date") or lease.get("scheduled_end_date")
+
+    def check_lease_period(db, lease):
+        start, end = lease_period(lease)
+        if end is not None and end < start:
+            return
+        rows = db.execute(
+            """SELECT * FROM leases WHERE tenant_id=? AND unit_id=? AND id<>?
+               AND status IN ('SIGNED','OCCUPIED','TERMINATION_PENDING','ENDED')""",
+            (TENANT_ID, lease["unit_id"], lease.get("id", 0)),
+        ).fetchall()
+        for other in rows:
+            other_start, other_end = lease_period(other)
+            if (other_end is None or other_end >= other_start) and overlaps(start, end, other_start, other_end):
+                conflict("同じ部屋の賃貸借契約期間が重複しています")
+
+    def refresh_occupancy(db, actor, unit_id):
+        unit = get(db, "units", unit_id)
+        leases = db.execute(
+            "SELECT status FROM leases WHERE tenant_id=? AND unit_id=? AND status<>'ENDED'",
+            (TENANT_ID, unit_id),
+        ).fetchall()
+        applications = db.execute(
+            "SELECT status FROM applications WHERE tenant_id=? AND unit_id=?", (TENANT_ID, unit_id),
+        ).fetchall()
+        lease_states = {row["status"] for row in leases}
+        application_states = {row["status"] for row in applications}
+        if "OCCUPIED" in lease_states:
+            status = "OCCUPIED"
+        elif "TERMINATION_PENDING" in lease_states:
+            status = "TERMINATION_PENDING"
+        elif lease_states or "APPROVED" in application_states:
+            status = "CONTRACTING"
+        elif application_states & {"RECEIVED", "SCREENING"}:
+            status = "APPLYING"
+        else:
+            status = "VACANT"
+        if unit["occupancy_status"] != status:
+            update(db, actor, "units", unit, {"occupancy_status": status})
+            audit(db, actor.user_id, "rental.unit.occupancy_updated", "unit", unit_id, status)
+
+    def detail(db, table, row_id):
+        row = decode(get(db, table, row_id))
+        if table == "buildings":
+            counts = db.execute(
+                """SELECT occupancy_status, COUNT(*) AS count FROM units
+                   WHERE tenant_id=? AND building_id=? GROUP BY occupancy_status""", (TENANT_ID, row_id),
+            ).fetchall()
+            row["occupancy_counts"] = {state: 0 for state in occupancy_states}
+            row["occupancy_counts"].update({item["occupancy_status"]: item["count"] for item in counts})
+            row["unit_count"] = sum(row["occupancy_counts"].values())
+        if table == "units":
+            today = datetime.now(JST).date()
+            contract = db.execute(
+                """SELECT mc.* FROM management_contract_units cu JOIN management_contracts mc
+                   ON mc.tenant_id=cu.tenant_id AND mc.id=cu.management_contract_id
+                   WHERE cu.tenant_id=? AND cu.unit_id=? AND mc.status IN ('ACTIVE','ENDED')
+                     AND cu.valid_from<=? AND (cu.valid_to IS NULL OR cu.valid_to>=?)
+                     AND mc.start_date<=? AND (mc.end_date IS NULL OR mc.end_date>=?)
+                   ORDER BY mc.status='ACTIVE' DESC, cu.valid_from DESC, mc.id DESC LIMIT 1""",
+                (TENANT_ID, row_id, today, today, today, today),
+            ).fetchone()
+            row["building_name"] = get(db, "buildings", row["building_id"])["building_name"]
+            row["current_management_contract"] = decode(contract) if contract else None
+            row["current_lease"] = db.execute(
+                """SELECT * FROM leases WHERE tenant_id=? AND unit_id=?
+                   AND status IN ('SIGNED','OCCUPIED','TERMINATION_PENDING')
+                   AND (start_date<=? OR actual_move_in_date<=?)
+                   AND (actual_move_out_date IS NULL OR actual_move_out_date>?)
+                   AND (status IN ('OCCUPIED','TERMINATION_PENDING') OR scheduled_end_date IS NULL OR scheduled_end_date>=?)
+                   ORDER BY status IN ('OCCUPIED','TERMINATION_PENDING') DESC, start_date DESC, id DESC LIMIT 1""",
+                (TENANT_ID, row_id, today, today, today, today),
+            ).fetchone()
+            row["recent_repairs"] = db.execute(
+                """SELECT id, work_order_code, received_date, description, status FROM work_orders
+                   WHERE tenant_id=? AND unit_id=? ORDER BY received_date DESC, id DESC LIMIT 10""",
+                (TENANT_ID, row_id),
+            ).fetchall()
+        if table == "management_contracts":
+            row["units"] = assignments(db, row_id)
+        if table == "applications":
+            row["lease"] = db.execute(
+                "SELECT id, lease_code, status FROM leases WHERE tenant_id=? AND application_id=?",
+                (TENANT_ID, row_id),
+            ).fetchone()
+        return row
+
+    def write(operation):
+        try:
+            with connect() as db:
+                # Unit locks serialize period checks. Reads after taking a lock must see the latest commit.
+                db.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                return operation(db)
+        except IntegrityError as error:
+            if error.args[0] == 1062:
+                conflict("同じコード、部屋番号、または申込の契約が既に登録されています")
+            if error.args[0] == 1452:
+                invalid("参照先のデータが見つかりません")
+            raise
+        except OperationalError as error:
+            if error.args[0] in {1205, 1213}:
+                conflict("同時に変更されています。最新のデータを読み込んでください")
+            raise
+
+    def create_record(db, actor, table, payload, *, application=None):
+        payload = dict(payload)
+        extra = {}
+        rows = None
+        if table == "parties":
+            extra = {"party_code": uuid.uuid4().hex, "status": "ACTIVE"}
+        elif table == "fee_plans":
+            extra = dict(fields(table, {"plan_version": payload.pop("plan_version", 1)}, ("plan_version",)),
+                         status="DRAFT")
+        elif table == "management_contracts":
+            plan = fields(table, {"fee_plan_id": payload.pop("fee_plan_id", None)}, ("fee_plan_id",))
+            rows = parse_assignments(payload.pop("units", []))
+            cutoff = payload.pop("settlement_cutoff_day", 31)
+            if type(cutoff) is not int or cutoff != 31:
+                invalid("精算締め日は月末固定です")
+            extra = dict(plan_snapshots(db, plan["fee_plan_id"]), settlement_cutoff_day=31, status="DRAFT")
+        elif table == "applications":
+            payload.setdefault("assigned_user_id", actor.user_id)
+            extra = {"status": "RECEIVED", "screening_result": "PENDING"}
+        elif table == "leases":
+            extra = {"status": "DRAFT"}
+            if application:
+                extra["application_id"] = application["id"]
+
+        if table == "management_contracts":
+            payload.setdefault("assigned_user_id", actor.user_id)
+        values = fields(table, {**defaults.get(table, {}), **payload}, editable[table].split(), create=True)
+        values.update(extra)
+        validate_refs(db, table, values)
+        validate_business(db, table, values)
+        if rows is not None:
+            check_assignments(db, values, rows)
+        if table in {"applications", "leases"}:
+            unit_locks(db, [values["unit_id"]])
+        if table == "leases":
+            check_lease_period(db, values)
+        row_id = insert(db, actor, table, values)
+        if table == "parties":
+            db.execute("UPDATE parties SET party_code=? WHERE tenant_id=? AND id=?",
+                       (f"P-{row_id}", TENANT_ID, row_id))
+        if rows is not None:
+            save_assignments(db, actor, row_id, rows, [])
+        if table in {"applications", "leases"}:
+            refresh_occupancy(db, actor, values["unit_id"])
+        audit(db, actor.user_id, f"rental.{table}.created", table, row_id, "登録")
+        return detail(db, table, row_id)
+
+    def parse_assignments(raw):
+        if not isinstance(raw, list) or len(raw) > 100 or any(not isinstance(row, dict) for row in raw):
+            invalid("部屋割当は100件以内で指定してください")
+        return [fields("management_contract_units", row, editable["management_contract_units"].split(), create=True)
+                for row in raw]
+
+    def edit_record(db, actor, table, row_id, payload):
+        if table in {"applications", "leases"}:
+            unit_locks(db, [get(db, table, row_id)["unit_id"]])
+        row = get(db, table, row_id, lock=True)
+        payload = dict(payload)
+        check_version(payload, row)
+        changed_assignments = table == "management_contracts" and "units" in payload
+        rows = parse_assignments(payload.pop("units")) if changed_assignments else None
+        allowed = editable[table].split()
+        if table == "management_contracts" and row["status"] in {"ENDED", "CANCELLED"}:
+            invalid("終了または取消済みの管理契約は変更できません")
+        if table == "management_contracts" and row["status"] == "ACTIVE":
+            allowed = [key for key in allowed if key not in {"owner_party_id", "start_date"}]
+        if table == "applications":
+            allowed = [key for key in allowed if key not in {"unit_id", "applicant_party_id"}]
+            if row["status"] in {"CONTRACTED", "REJECTED", "WITHDRAWN"}:
+                allowed = ["external_procedure_status", "external_reference", "notes"]
+        if table == "leases":
+            allowed = [key for key in allowed if key != "unit_id"]
+            if row["application_id"] is not None:
+                allowed.remove("tenant_party_id")
+            if row["status"] != "DRAFT":
+                allowed = ["external_signature_status"]
+        values = fields(table, payload, allowed)
+        if not values and rows is None:
+            invalid("更新項目を入力してください")
+        validate_refs(db, table, values)
+        merged = row | values
+        validate_business(db, table, merged)
+        if table == "management_contracts":
+            previous = assignments(db, row_id)
+            check_assignments(db, merged, previous if rows is None else rows, previous)
+            if rows is not None:
+                save_assignments(db, actor, row_id, rows, previous)
+                # Assignment-only edits also advance the contract version.
+                values.setdefault("end_date", row["end_date"])
+        if table == "leases" and row["status"] == "DRAFT":
+            check_lease_period(db, merged)
+        update(db, actor, table, row, values)
+        audit(db, actor.user_id, f"rental.{table}.updated", table, row_id, "更新")
+        return detail(db, table, row_id)
+
+    transitions = {
+        "parties": {"inactivate": (("ACTIVE",), "INACTIVE", ())},
+        "fee_plans": {
+            "activate": (("DRAFT",), "ACTIVE", ()),
+            "retire": (("ACTIVE",), "RETIRED", ()),
+        },
+        "management_contracts": {
+            "activate": (("DRAFT",), "ACTIVE", ()),
+            "end": (("ACTIVE",), "ENDED", ("end_date", "termination_reason")),
+            "cancel": (("DRAFT",), "CANCELLED", ()),
+        },
+        "applications": {
+            "screen": (("RECEIVED",), "SCREENING", ("notes",)),
+            "approve": (("SCREENING",), "APPROVED", ("notes",)),
+            "reject": (("SCREENING",), "REJECTED", ("cancellation_reason",)),
+            "withdraw": (("RECEIVED", "SCREENING", "APPROVED"), "WITHDRAWN", ("cancellation_reason",)),
+        },
+        "leases": {
+            "sign": (("DRAFT",), "SIGNED", ("signed_date",)),
+            "move-in": (("SIGNED",), "OCCUPIED", ("actual_move_in_date",)),
+            "notice": (("OCCUPIED",), "TERMINATION_PENDING",
+                       ("termination_notice_date", "scheduled_move_out_date", "termination_reason")),
+            "move-out": (("TERMINATION_PENDING",), "ENDED", ("actual_move_out_date",)),
+        },
+    }
+
+    def lease_transition(db, row, action, values, today):
+        if action == "sign":
+            values.setdefault("signed_date", today)
+        elif action == "move-in":
+            values.setdefault("actual_move_in_date", today)
+        elif action == "notice":
+            values.setdefault("termination_notice_date", today)
+            if not values.get("scheduled_move_out_date"):
+                invalid("退去予定日を入力してください")
+        elif action == "move-out":
+            values.setdefault("actual_move_out_date", today)
+        merged = row | values
+        for key in ("signed_date", "actual_move_in_date", "termination_notice_date", "actual_move_out_date"):
+            if key in values and (values[key] is None or values[key] > today):
+                invalid(f"実績日は本日以前の日付を指定してください（{key}）")
+        for first, last in (
+            ("signed_date", "actual_move_in_date"), ("actual_move_in_date", "termination_notice_date"),
+            ("termination_notice_date", "scheduled_move_out_date"), ("termination_notice_date", "actual_move_out_date"),
+            ("actual_move_in_date", "scheduled_end_date"), ("start_date", "actual_move_out_date"),
+        ):
+            ordered_dates(merged, first, last)
+        if action == "move-in":
+            occupied = db.execute(
+                """SELECT id FROM leases WHERE tenant_id=? AND unit_id=? AND id<>?
+                   AND status IN ('OCCUPIED','TERMINATION_PENDING') LIMIT 1""",
+                (TENANT_ID, row["unit_id"], row["id"]),
+            ).fetchone()
+            if occupied:
+                conflict("同じ部屋に退去前の賃貸借契約があります")
+        check_lease_period(db, merged)
+
+    def transition_record(db, actor, table, row_id, action, payload):
+        if table in {"applications", "leases"}:
+            unit_locks(db, [get(db, table, row_id)["unit_id"]])
+        row = get(db, table, row_id, lock=True)
+        payload = dict(payload)
+        check_version(payload, row)
+        sources, target, allowed = transitions[table][action]
+        if row["status"] not in sources:
+            invalid(f"現在の状態（{row['status']}）から指定の操作はできません（{target}）")
+        values = fields(table, payload, allowed)
+        today = datetime.now(JST).date()
+        if table == "management_contracts":
+            rows = assignments(db, row_id)
+            if action == "activate":
+                if not rows:
+                    invalid("有効化には部屋の割当が必要です")
+                check_assignments(db, row, rows)
+            elif action == "end":
+                if not values.get("termination_reason"):
+                    invalid("契約の終了理由を入力してください")
+                values["end_date"] = values.get("end_date") or row["end_date"] or today
+                ordered_dates(row | values, "start_date", "end_date")
+                unit_locks(db, [item["unit_id"] for item in rows])
+        if table == "applications":
+            if action in {"reject", "withdraw"} and not values.get("cancellation_reason"):
+                invalid("却下または取下げの理由を入力してください")
+            if action in {"approve", "reject"}:
+                values["screening_result"] = target
+        if table == "leases":
+            lease_transition(db, row, action, values, today)
+        update(db, actor, table, row, dict(values, status=target))
+        if table in {"applications", "leases"}:
+            refresh_occupancy(db, actor, row["unit_id"])
+        audit(db, actor.user_id, f"rental.{table}.{action}", table, row_id, f"{row['status']} → {target}")
+        return detail(db, table, row_id)
+
+    def generate_lease(db, actor, row_id, payload):
+        unit_locks(db, [get(db, "applications", row_id)["unit_id"]])
+        row = get(db, "applications", row_id, lock=True)
+        if db.execute("SELECT id FROM leases WHERE tenant_id=? AND application_id=?", (TENANT_ID, row_id)).fetchone():
+            conflict("この申込から賃貸借契約は既に作成されています")
+        payload = dict(payload)
+        check_version(payload, row)
+        if row["status"] != "APPROVED":
+            invalid("承認された申込からのみ賃貸借契約を作成できます")
+        copied = {
+            "unit_id": row["unit_id"], "tenant_party_id": row["applicant_party_id"],
+            "start_date": row["desired_move_in_date"].isoformat(),
+            "rent_amount": row["proposed_rent"], "common_fee_amount": row["proposed_common_fee"],
+        }
+        if payload.keys() & copied.keys():
+            invalid("部屋・申込者・入居希望日・申込金額は申込から引き継ぎます")
+        lease = create_record(db, actor, "leases", copied | payload, application=row)
+        update(db, actor, "applications", row, {"status": "CONTRACTED"})
+        audit(db, actor.user_id, "rental.applications.contracted", "applications", row_id, f"賃貸借契約 {lease['id']}")
+        return lease
+
+    def list_records(table, limit, offset, status, owner_only, building_id, occupancy_status):
+        filters = ["t.tenant_id=?"]
+        args = [TENANT_ID]
+        if status is not None:
+            if table == "units":
+                invalid("部屋は occupancy_status で絞り込んでください")
+            filters.append("t.status=?")
+            args.append(status)
+        if table == "parties" and owner_only:
+            filters.append(
+                "EXISTS (SELECT 1 FROM management_contracts mc WHERE mc.tenant_id=t.tenant_id AND mc.owner_party_id=t.id)"
+            )
+        select, join = "t.*", ""
+        if table == "units":
+            select += ", b.building_name"
+            join = "JOIN buildings b ON b.tenant_id=t.tenant_id AND b.id=t.building_id"
+            for column, value in (("building_id", building_id), ("occupancy_status", occupancy_status)):
+                if value is not None:
+                    filters.append(f"t.{column}=?")
+                    args.append(value)
+        if table in {"applications", "leases"}:
+            party = "applicant_party_id" if table == "applications" else "tenant_party_id"
+            select += ", p.display_name, u.unit_number, b.building_name"
+            join = f"""JOIN parties p ON p.tenant_id=t.tenant_id AND p.id=t.{party}
+                       JOIN units u ON u.tenant_id=t.tenant_id AND u.id=t.unit_id
+                       JOIN buildings b ON b.tenant_id=u.tenant_id AND b.id=u.building_id"""
+        if table == "management_contracts":
+            select += ", p.display_name"
+            join = "JOIN parties p ON p.tenant_id=t.tenant_id AND p.id=t.owner_party_id"
+        with connect() as db:
+            if table == "units" and building_id is not None:
+                get(db, "buildings", building_id)
+            rows = db.execute(
+                f"SELECT {select} FROM {table} t {join} WHERE {' AND '.join(filters)} ORDER BY t.id LIMIT ? OFFSET ?",
+                (*args, limit, offset),
+            ).fetchall()
+            return [decode(row) for row in rows]
+
+    @router.get("/staff", dependencies=[Depends(require_staff)])
+    def staff(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
         with connect() as db:
             return db.execute(
-                """SELECT id, building_code, building_name, address, building_type, status
-                   FROM buildings WHERE tenant_id=? ORDER BY id LIMIT ? OFFSET ?""",
-                (TENANT_ID, limit, offset),
+                """SELECT id, COALESCE(display_name,name) AS display_name FROM users
+                   WHERE account_status='ACTIVE' AND role IN
+                   ('executive','administrator','hq_staff','store_manager','advisor','finance')
+                   ORDER BY id LIMIT ? OFFSET ?""", (limit, offset),
             ).fetchall()
 
-    @router.get("/units", dependencies=[Depends(require_staff)])
-    def units(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
+    @router.get("/charge-types", dependencies=[Depends(require_staff)])
+    def charge_types(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
         with connect() as db:
             return db.execute(
-                """SELECT u.id, u.building_id, b.building_name, u.unit_number, u.advertised_rent,
-                          u.advertised_common_fee, u.management_status, u.occupancy_status
-                   FROM units u JOIN buildings b ON b.tenant_id=u.tenant_id AND b.id=u.building_id
-                   WHERE u.tenant_id=? ORDER BY u.id LIMIT ? OFFSET ?""",
-                (TENANT_ID, limit, offset),
+                """SELECT charge_code, charge_name FROM charge_types
+                   WHERE tenant_id=? AND status='ACTIVE' ORDER BY id LIMIT ? OFFSET ?""", (TENANT_ID, limit, offset),
             ).fetchall()
+
+    def register_resource(table):
+        dependencies = [Depends(require_staff)]
+        path = "/" + table.replace("_", "-")
+
+        @router.get(path, dependencies=dependencies, name=f"rental_{table}_list")
+        def listing(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0),
+                    status: str = None, owner_only: bool = False, building_id: int = None,
+                    occupancy_status: str = None):
+            return list_records(table, limit, offset, status, owner_only, building_id, occupancy_status)
+
+        @router.get(f"{path}/{{row_id}}", dependencies=dependencies, name=f"rental_{table}_detail")
+        def read(row_id: int):
+            with connect() as db:
+                return detail(db, table, row_id)
+
+        @router.post(path, status_code=201, name=f"rental_{table}_create")
+        def create(payload: dict, actor=Depends(require_staff)):
+            return write(lambda db: create_record(db, actor, table, payload))
+
+        @router.put(f"{path}/{{row_id}}", name=f"rental_{table}_update")
+        def edit(row_id: int, payload: dict, actor=Depends(require_staff)):
+            return write(lambda db: edit_record(db, actor, table, row_id, payload))
+
+        def register_transition(action):
+            @router.post(f"{path}/{{row_id}}/{action}", name=f"rental_{table}_{action}")
+            def change(row_id: int, payload: dict, actor=Depends(require_staff)):
+                return write(lambda db: transition_record(db, actor, table, row_id, action, payload))
+
+        for action in transitions.get(table, {}):
+            register_transition(action)
+
+    for table in editable:
+        if table != "management_contract_units":
+            register_resource(table)
+
+    @router.post("/applications/{row_id}/create-lease", status_code=201)
+    def create_lease(row_id: int, payload: dict, actor=Depends(require_staff)):
+        return write(lambda db: generate_lease(db, actor, row_id, payload))
 
     app.include_router(router)
