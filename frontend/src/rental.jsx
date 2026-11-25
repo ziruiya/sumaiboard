@@ -1048,7 +1048,8 @@ function RentalFunds({ apiBase }) {
   }}</RentalResult>;
 }
 
-const repairStates = ["RECEIVED", "ESTIMATED", "APPROVED", "ARRANGED", "COMPLETED", "INSPECTED", "COST_CONFIRMED", "CLOSED"];
+const cancellableRepairStates = ["RECEIVED", "ESTIMATED", "APPROVED", "ARRANGED"];
+const repairStates = [...cancellableRepairStates, "COMPLETED", "INSPECTED", "COST_CONFIRMED", "CLOSED", "CANCELLED"];
 const complaintStates = ["OPEN", "IN_PROGRESS", "RESOLVED", "CLOSED"];
 const urgencies = ["URGENT", "HIGH", "NORMAL", "LOW"];
 const bearers = ["OWNER", "COMPANY", "TENANT"];
@@ -1059,7 +1060,7 @@ const caseFields = [
 ];
 const inspectionFields = [
   ["inspection_type", "点検種別", ["ROUTINE", "OTHER"]], ["inspection_date", "点検日", "date"],
-  ["inspected_by", "点検者", "@staff"], ["result", "判定", ["PASS", "FAIL"]],
+  ["result", "判定", ["PASS", "FAIL"]],
   ["findings", "所見", "notes"], ["next_inspection_date", "次回点検日", "optionalDate"],
 ];
 const caseResources = {
@@ -1080,12 +1081,13 @@ const caseResources = {
 Object.assign(resources, caseResources);
 
 const reapproveRepair = ["reapprove", "再承認", [["approved_amount", "再承認額（円）", "integer"]]];
+const cancelRepair = ["cancel", "修繕を取り消す", [["cancellation_reason", "取消理由", "requiredNotes"]]];
 const repairActions = {
   RECEIVED: [["estimate", "見積を記録", [["estimated_amount", "見積額（円）", "integer"], ["cost_bearer", "費用負担者", bearers]]]],
   ESTIMATED: [["approve", "承認", [["approved_amount", "承認額（円）", "integer"]]]],
   APPROVED: [["arrange", "手配", [["contractor_party_id", "協力会社", "@parties"], ["scheduled_date", "作業予定日", "date"]]]],
   ARRANGED: [["complete", "作業完了", [["completed_date", "完了日", "date"], ["actual_amount", "暫定実費（円）", "integer"]]]],
-  COMPLETED: [["inspect", "検収", [["inspected_by", "検収者", "@staff"], ["inspected_date", "検収日", "date"], ["findings", "所見", "notes"]]], reapproveRepair],
+  COMPLETED: [["inspect", "検収", [["inspected_date", "検収日", "date"], ["findings", "所見", "notes"]]], reapproveRepair],
   INSPECTED: [["confirm-cost", "費用確定", [["actual_amount", "実費（円）", "integer"]]], reapproveRepair],
   COST_CONFIRMED: [["close", "修繕を終了", []]],
 };
@@ -1145,7 +1147,7 @@ function CaseList({ apiBase, tab, open, create }) {
     <RentalResult result={result}>{(rows) => <>
       <MoneyList rows={rows} render={(row) => {
         const urgent = tab === "work-orders" && row.urgency === "URGENT" &&
-          repairStates.indexOf(row.status) < repairStates.indexOf("COMPLETED");
+          cancellableRepairStates.includes(row.status);
         const days = urgent ? Math.max(0, (Date.parse(todayJst()) - Date.parse(row.received_date)) / 86400000) : null;
         return <button type="button" className="rental-list-button" onClick={() => open(tab, row.id)}>
           <strong>{resource.name(row)}</strong>
@@ -1174,7 +1176,8 @@ function CaseRecord({ apiBase, resource, row, reload, open }) {
   const [action, setAction] = useState(null);
   const repair = resource === "work-orders";
   const complaint = resource === "complaints";
-  const actions = repair ? repairActions[row.status] || [] : [...(complaintActions[row.status] || [])];
+  const actions = [...((repair ? repairActions : complaintActions)[row.status] || [])];
+  if (repair && cancellableRepairStates.includes(row.status)) actions.push(cancelRepair);
   if (complaint && !row.work_order && ["OPEN", "IN_PROGRESS"].includes(row.status)) actions.push(convertComplaint);
   if (action) return <RentalForm apiBase={apiBase} resource={resource} record={row} action={action}
     onCancel={() => setAction(null)} onReload={reload}
@@ -1193,7 +1196,7 @@ function CaseRecord({ apiBase, resource, row, reload, open }) {
   ] : complaint ? [
     ["received_at", "受付日時"], ["reporter_party_id", "申出者 ID"], ["resolved_at", "解決日時"],
     ["resolution_summary", "対応結果"],
-  ] : inspectionFields.map(([key, label]) => [key, key === "inspected_by" ? "点検者 ID" : label]);
+  ] : [...inspectionFields.map(([key, label]) => [key, label]), ["inspected_by", "点検者 ID"]];
 
   return <div className="panel rental-form">
     <h2>{caseResources[resource].name(row)}</h2>

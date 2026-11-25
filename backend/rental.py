@@ -2438,17 +2438,19 @@ def register_rental_routes(app, connect, require_actor, audit):
 
     case_location = "building_id unit_id"
     case_fields = "category urgency description assigned_user_id"
-    inspection_fields = "inspection_type inspection_date inspected_by result findings next_inspection_date"
+    inspection_fields = "inspection_type inspection_date result findings next_inspection_date"
+    approval_actions = {"approve", "reapprove"}
     work_actions = {
         "estimate": (("RECEIVED",), "ESTIMATED", "estimated_amount cost_bearer", ("estimated_amount",)),
-        "approve": (("ESTIMATED",), "APPROVED", "approved_amount approved_by", ("approved_amount",)),
+        "approve": (("ESTIMATED",), "APPROVED", "approved_amount", ("approved_amount",)),
         "arrange": (("APPROVED",), "ARRANGED", "contractor_party_id scheduled_date",
                     ("contractor_party_id", "scheduled_date")),
         "complete": (("ARRANGED",), "COMPLETED", "completed_date actual_amount", ("completed_date", "actual_amount")),
-        "inspect": (("COMPLETED",), "INSPECTED", "inspected_by inspected_date", ("inspected_date",)),
+        "inspect": (("COMPLETED",), "INSPECTED", "inspected_date", ("inspected_date",)),
         "confirm-cost": (("INSPECTED",), "COST_CONFIRMED", "actual_amount", ("actual_amount",)),
-        "reapprove": (("COMPLETED", "INSPECTED"), None, "approved_amount approved_by", ("approved_amount",)),
+        "reapprove": (("COMPLETED", "INSPECTED"), None, "approved_amount", ("approved_amount",)),
         "close": (("COST_CONFIRMED",), "CLOSED", "", ()),
+        "cancel": (("RECEIVED", "ESTIMATED", "APPROVED", "ARRANGED"), "CANCELLED", "", ()),
     }
     complaint_actions = {
         "start": ("OPEN", "IN_PROGRESS"),
@@ -2497,6 +2499,8 @@ def register_rental_routes(app, connect, require_actor, audit):
             if values.get("management_contract_id") not in (None, contract_id):
                 invalid("指定した管理契約は受付日にこの部屋を管理していません")
             values["management_contract_id"] = contract_id
+        elif values.get("management_contract_id") is not None:
+            invalid("建物単位の修繕には管理契約を指定できません")
         validate_refs(db, "work_orders", values)
         return insert_case(db, actor, "work_orders", dict(
             values, work_order_code=f"WO-{uuid.uuid4().hex}", status="RECEIVED",
@@ -2504,16 +2508,16 @@ def register_rental_routes(app, connect, require_actor, audit):
 
     @router.post("/work-orders", status_code=201)
     def create_work_order(payload: dict, actor=Depends(require_staff)):
+        if "complaint_id" in payload:
+            invalid("苦情との紐付けは苦情の修繕化から行ってください")
         values = case_data(
             "work_orders", payload,
-            f"{case_location} {case_fields} received_date management_contract_id complaint_id cost_bearer",
+            f"{case_location} {case_fields} received_date management_contract_id cost_bearer",
             f"building_id {case_fields} received_date",
         )
 
         def operation(db):
-            complaint_id = values.get("complaint_id")
-            complaint = get(db, "complaints", complaint_id, lock=True) if complaint_id else None
-            return create_work_order_record(db, actor, values, complaint)
+            return create_work_order_record(db, actor, values, None)
 
         return write(operation)
 
@@ -2537,8 +2541,9 @@ def register_rental_routes(app, connect, require_actor, audit):
     def create_inspection(payload: dict, actor=Depends(require_staff)):
         values = case_data(
             "inspections", payload, f"{case_location} {inspection_fields}",
-            "building_id inspection_type inspection_date inspected_by result",
+            "building_id inspection_type inspection_date result",
         )
+        values["inspected_by"] = actor.user_id
         ordered_dates(values, "inspection_date", "next_inspection_date")
 
         def operation(db):
@@ -2555,10 +2560,21 @@ def register_rental_routes(app, connect, require_actor, audit):
               f"{row['status']} → {target}{note}")
         return get(db, table, row["id"])
 
+    def has_work_order_management_contract(db, row):
+        if row["unit_id"] is None or row["management_contract_id"] is None:
+            return False
+        received = row["received_date"]
+        contract = management_for_period(db, row["unit_id"], received, received)
+        return contract is not None and contract["id"] == row["management_contract_id"]
+
     @router.post("/work-orders/{row_id}/{action}")
     def transition_work_order(row_id: int, action: str, payload: dict, actor=Depends(require_staff)):
         if action not in work_actions:
             raise HTTPException(404, "指定された修繕操作が見つかりません")
+        if action in approval_actions and actor.account_role not in {
+            "executive", "finance", "store_manager", "administrator",
+        }:
+            raise HTTPException(403, "修繕を承認する権限がありません")
         sources, target, allowed, required = work_actions[action]
 
         def operation(db):
@@ -2570,19 +2586,30 @@ def register_rental_routes(app, connect, require_actor, audit):
             findings = None
             if action == "inspect":
                 findings = fields("inspections", {"findings": data.pop("findings", None)}, ("findings",))["findings"]
+            note = ""
+            if action == "cancel":
+                reason = data.pop("cancellation_reason", None)
+                if not isinstance(reason, str) or not reason.strip() or len(reason) > 16000:
+                    invalid("取消理由を入力してください（16,000文字以内）")
+                note = f" / 取消理由: {reason.strip()}"
             values = money_values("work_orders", data, allowed, required=required)
             if action == "estimate":
                 if not values.get("cost_bearer", row["cost_bearer"]):
                     invalid("見積時に費用負担者を指定してください")
-            if action in {"approve", "reapprove"}:
-                values["approved_by"] = values.get("approved_by", actor.user_id)
+            if action in approval_actions:
+                values["approved_by"] = actor.user_id
+            if action == "complete":
+                if values["completed_date"] < row["received_date"]:
+                    invalid("完了日は受付日以後にしてください")
+                if values["completed_date"] > today_jst():
+                    invalid("完了日に未来日は指定できません")
             if action == "inspect":
-                values["inspected_by"] = values.get("inspected_by", actor.user_id)
-            for key in ("approved_by", "inspected_by"):
-                if key in values and (type(values[key]) is not int or values[key] < 1):
-                    invalid(f"有効な担当者を指定してください（{key}）")
+                if row["completed_date"] is None or values["inspected_date"] < row["completed_date"]:
+                    invalid("検収日は作業完了日以後にしてください")
+                if values["inspected_date"] > today_jst():
+                    invalid("検収日に未来日は指定できません")
+                values["inspected_by"] = actor.user_id
             validate_refs(db, "work_orders", values)
-            note = ""
             if action == "inspect":
                 inspection = insert_case(db, actor, "inspections", {
                     "building_id": row["building_id"], "unit_id": row["unit_id"], "work_order_id": row_id,
@@ -2591,6 +2618,11 @@ def register_rental_routes(app, connect, require_actor, audit):
                 })
                 note = f" / 検収記録 {inspection['id']}"
             if action == "confirm-cost":
+                if row["cost_bearer"] == "OWNER":
+                    if row["unit_id"] is not None:
+                        get(db, "units", row["unit_id"], lock=True)
+                    if not has_work_order_management_contract(db, row):
+                        invalid("オーナー負担の費用確定には有効な管理契約が必要です")
                 if row["approved_amount"] is None or values["actual_amount"] > row["approved_amount"]:
                     invalid("実費が承認額を超えています。先に再承認（reapprove）してください")
                 now = datetime.now(timezone.utc)
@@ -2649,6 +2681,8 @@ def register_rental_routes(app, connect, require_actor, audit):
                 values = case_data("complaints", dict(data, resolution_summary=summary),
                                    "resolution_summary", "resolution_summary")
                 values["resolved_at"] = datetime.now(timezone.utc).replace(tzinfo=None)
+                if values["resolved_at"] < row["received_at"]:
+                    invalid("解決日時は受付日時以後にしてください")
             else:
                 values = fields("complaints", data, ())
             return change_case(db, actor, "complaints", row, action, dict(values, status=target))
@@ -2696,6 +2730,8 @@ def register_rental_routes(app, connect, require_actor, audit):
                     )
                     row["settlement_eligible"] = (
                         row["status"] in {"COST_CONFIRMED", "CLOSED"} and row["cost_bearer"] == "OWNER"
+                        and row["actual_amount"] is not None and row["cost_confirmed_at"] is not None
+                        and bool(row["inspections"]) and has_work_order_management_contract(db, row)
                     )
                     row["settlement_participated"] = db.execute(
                         """SELECT 1 FROM settlement_lines
