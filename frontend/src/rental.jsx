@@ -709,6 +709,10 @@ function RentCharges({ apiBase }) {
     {generated?.service_month.slice(0, 7) === month && <p role="status">
       {generated.generated_count} 件生成・{generated.skipped_count} 件スキップ
       {generated.leases_without_management_contract > 0 && `（管理契約のない賃貸借契約 ${generated.leases_without_management_contract} 件）`}
+      {generated.skip_reasons.MANAGEMENT_CHANGED_MIDMONTH > 0 &&
+        `（月中に管理契約が変更 ${generated.skip_reasons.MANAGEMENT_CHANGED_MIDMONTH} 件）`}
+      {generated.skip_reasons.PARTIAL_MANAGEMENT_COVERAGE > 0 &&
+        `（管理期間が一部のみ ${generated.skip_reasons.PARTIAL_MANAGEMENT_COVERAGE} 件）`}
     </p>}
     <MoneyError action={action}/>
     {cancel && <MoneyReasonForm key={cancel.id} apiBase={apiBase}
@@ -761,7 +765,7 @@ function RentPaymentRegistration({ apiBase, saved }) {
       </select></label>
       <label>入金口座<select name="fund_account_id" required
         defaultValue={accounts.find((account) => account.account_code === "ESCROW")?.id}>
-        {accounts.filter((account) => account.status === "ACTIVE").map((account) =>
+        {accounts.filter((account) => account.status === "ACTIVE" && account.account_code === "ESCROW").map((account) =>
           <option key={account.id} value={account.id}>{account.account_name}</option>)}
       </select></label>
       <ReferenceField apiBase={apiBase} label="管理契約（未識別の場合は空欄）" resource="management-contracts"
@@ -880,9 +884,96 @@ function RentOverdue({ apiBase }) {
   </>}</RentalResult>;
 }
 
+const depositStatuses = {
+  EXPECTED: "受領待ち", PARTIALLY_HELD: "一部受領", HELD: "預り中",
+  PARTIALLY_RETURNED: "一部返還", CLOSED: "完了",
+};
+
+const depositCustodians = { COMPANY: "自社", OWNER: "オーナー", OTHER: "その他" };
+
+function DepositEventForm({ apiBase, row, receive, cap, saved, close }) {
+  const action = useMoneyAction(apiBase);
+  const label = receive ? "受領" : "返還";
+  const dateField = receive ? "received_date" : "refunded_date";
+  const noteField = receive ? "payer_name" : "reason";
+  const latestDate = row.ledger_entries.reduce((latest, entry) =>
+    entry.posting_date > latest ? entry.posting_date : latest, "");
+  return <form className="panel rental-form" onSubmit={(event) => {
+    event.preventDefault();
+    const values = Object.fromEntries(new FormData(event.currentTarget));
+    action.submit(`deposits/${row.id}/${receive ? "receive" : "refund"}`, {
+      ...values, amount: Number(values.amount), version: row.version,
+    }, saved);
+  }}>
+    <h3>敷金{label}</h3>
+    <div className="rental-fields">
+      <label>{label}日<input type="date" name={dateField} required defaultValue={todayJst()}
+        min={latestDate || undefined} max={todayJst()}/></label>
+      <label>{label}額（円）<input type="number" name="amount" min="1" max={cap} required/></label>
+      <label>{receive ? "支払者" : "返還理由"}<input name={noteField} required/></label>
+    </div>
+    <MoneyError action={action} refresh={saved}/>
+    <div className="rental-controls">
+      <button className="primary-btn" disabled={action.busy}>{label}を登録</button>
+      <button type="button" className="secondary-btn" onClick={close} disabled={action.busy}>戻る</button>
+    </div>
+  </form>;
+}
+
+function RentDepositDetail({ apiBase, depositId, close }) {
+  const result = useRentalData(apiBase, `deposits/${depositId}`);
+  const [event, setEvent] = useState(null);
+  return <div className="rental-stack">
+    <div><button type="button" className="secondary-btn" onClick={close}>敷金一覧に戻る</button></div>
+    <RentalResult result={result}>{(row) => {
+      const balance = row.received_amount - row.refunded_amount - row.transferred_amount;
+      const canReceive = row.custodian_type === "COMPANY" && row.lease_status !== "CANCELLED" &&
+        ["EXPECTED", "PARTIALLY_HELD"].includes(row.status) && row.agreed_amount > row.received_amount;
+      const canRefund = row.custodian_type === "COMPANY" && balance > 0;
+      return <>
+        <div className="panel">
+          <h2>敷金 · {row.lease_code}</h2>
+          <p>{depositStatuses[row.status]} · 保管者 {depositCustodians[row.custodian_type]}</p>
+          <RecordValues row={{ ...row, balance }} fields={[
+            ["agreed_amount", "約定額", "money"], ["received_amount", "受領額", "money"],
+            ["refunded_amount", "返還額", "money"], ["balance", "預り残高", "money"],
+          ]}/>
+        </div>
+        <div className="rental-controls">
+          {canReceive && <button type="button" className="secondary-btn" onClick={() => setEvent("receive")}>受領する</button>}
+          {canRefund && <button type="button" className="secondary-btn" onClick={() => setEvent("refund")}>返還する</button>}
+        </div>
+        {(event === "receive" ? canReceive : event === "refund" && canRefund) &&
+          <DepositEventForm key={event} apiBase={apiBase} row={row} receive={event === "receive"}
+            cap={Math.min(event === "receive" ? row.agreed_amount - row.received_amount : balance, Number.MAX_SAFE_INTEGER)}
+            close={() => setEvent(null)} saved={() => { setEvent(null); result.retry(); }}/>}
+        <h3>台帳履歴</h3>
+        <MoneyList rows={[...row.ledger_entries].reverse()} empty="台帳履歴がありません。" render={(entry) =>
+          <MoneyRow title={entry.direction === "IN" ? "受領" : "返還"}
+            description={[entry.posting_date, entry.reason].filter(Boolean).join(" · ")}
+            balance={yen.format(entry.direction === "IN" ? entry.amount : -entry.amount)}/>}/>
+      </>;
+    }}</RentalResult>
+  </div>;
+}
+
+function RentDeposits({ apiBase }) {
+  const [offset, setOffset] = useState(0);
+  const [depositId, setDepositId] = useState(null);
+  const result = useRentalData(apiBase, `deposits?offset=${offset}`);
+  if (depositId !== null) return <RentDepositDetail key={depositId} apiBase={apiBase} depositId={depositId}
+    close={() => { setDepositId(null); result.retry(); }}/>;
+  return <RentalResult result={result}>{(rows) => <>
+    <MoneyList rows={rows} empty="敷金の記録がありません。" render={(row) => <MoneyRow
+      title={row.lease_code} description={`${depositStatuses[row.status]} · 保管者 ${depositCustodians[row.custodian_type]}`}
+      balance={yen.format(row.agreed_amount)} onClick={() => setDepositId(row.id)} actionLabel="敷金詳細"/>}/>
+    <Pager offset={offset} count={rows.length} setOffset={setOffset}/>
+  </>}</RentalResult>;
+}
+
 function RentalRent({ apiBase }) {
   const [view, setView] = useState("請求");
-  const views = { "請求": RentCharges, "入金": RentPayments, "消込": RentAllocation, "滞納": RentOverdue };
+  const views = { "請求": RentCharges, "入金": RentPayments, "消込": RentAllocation, "滞納": RentOverdue, "敷金": RentDeposits };
   const View = views[view];
   return <div className="rental-stack">
     <nav className="rental-controls" aria-label="家賃収納の表示対象">
@@ -895,20 +986,35 @@ function RentalRent({ apiBase }) {
 
 function RentalFunds({ apiBase }) {
   const result = useRentalData(apiBase, "funds/summary");
-  return <RentalResult result={result}>{(data) => <div className="rental-stack">
-    <div className="rental-metrics">
-      {data.accounts.map((account) => <div className="panel rental-metric" key={account.id}>
-        <span>{account.account_name}</span><strong>{yen.format(account.balance)}</strong>
-      </div>)}
-      <div className={`panel rental-metric${data.reconciliation_difference ? " rental-error" : ""}`}
-        role={data.reconciliation_difference ? "alert" : undefined}>
-        <span>照合差額</span><strong>{yen.format(data.reconciliation_difference)}</strong>
+  return <RentalResult result={result}>{(data) => {
+    const checks = { unallocated: "未消込", deposit: "敷金", owner_allocation: "オーナー費目消込" };
+    const differences = data.business_reconciliation.flatMap((row) =>
+      Object.entries(checks).filter(([key]) => row[key].difference !== 0).map(([key, label]) => ({
+        id: `${row.management_contract_id}-${key}`, contractId: row.management_contract_id,
+        label, amount: row[key].difference,
+      })));
+    return <div className="rental-stack">
+      <div className="rental-metrics">
+        {data.accounts.map((account) => <div className="panel rental-metric" key={account.id}>
+          <span>{account.account_name}</span><strong>{yen.format(account.balance)}</strong>
+        </div>)}
+        <div className={`panel rental-metric${data.reconciliation_difference ? " rental-error" : ""}`}
+          role={data.reconciliation_difference ? "alert" : undefined}>
+          <span>照合差額</span><strong>{yen.format(data.reconciliation_difference)}</strong>
+        </div>
       </div>
-    </div>
-    <div className="panel">
-      <h2>預り金口座の内訳</h2>
-      <RecordValues row={data.escrow_categories}
-        fields={Object.entries(fundCategoryNames).map(([key, label]) => [key, label, "money"])}/>
-    </div>
-  </div>}</RentalResult>;
+      {data.accounts.map((account) => <div className="panel" key={account.id}>
+        <h2>{account.account_name}の内訳</h2>
+        <RecordValues row={account.categories}
+          fields={Object.entries(fundCategoryNames).filter(([key]) => key in account.categories)
+            .map(([key, label]) => [key, label, "money"])}/>
+      </div>)}
+      <div className="panel">
+        <h2>業務データとの照合</h2>
+        {differences.length ? <ul className="rental-error" role="alert">{differences.map((row) =>
+          <li key={row.id}>管理契約 ID {row.contractId} · {row.label}の差額 {yen.format(row.amount)}</li>)}</ul>
+          : <p>全 {data.business_reconciliation.length} 契約の照合差額 {yen.format(0)}</p>}
+      </div>
+    </div>;
+  }}</RentalResult>;
 }
