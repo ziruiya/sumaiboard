@@ -4,6 +4,7 @@ import json
 import random
 import re
 import uuid
+from calendar import monthrange
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
@@ -653,7 +654,7 @@ def register_rental_routes(app, connect, require_actor, audit):
         "plan_code", "plan_version", "rate", "calculation_basis", "tax_inclusive",
         "tax_rate", "vacancy_exempt", "rounding_rule", "minimum_fee", "included_charge_types",
     )
-    json_fields = {"included_charge_types", "fee_plan_snapshot", "charge_rule_snapshot"}
+    json_fields = {"included_charge_types", "fee_plan_snapshot", "charge_rule_snapshot", "beneficiary_snapshot"}
     boolean_fields = {"tax_inclusive", "vacancy_exempt", "refundable", "recurring", "settlement_eligible"}
     occupancy_states = ("VACANT", "APPLYING", "CONTRACTING", "OCCUPIED", "TERMINATION_PENDING")
     choices = {
@@ -665,6 +666,7 @@ def register_rental_routes(app, connect, require_actor, audit):
         "proration_rule": ("ACTUAL_DAYS_FLOOR",),
         "screening_result": ("PENDING", "APPROVED", "REJECTED"),
     }
+    choices["payment_source"] = ("TENANT", "GUARANTOR_COMPANY", "OTHER")
     for field in ("external_signature_status", "external_procedure_status"):
         choices[field] = ("NOT_STARTED_SAMPLE", "IN_PROGRESS_SAMPLE", "RECORDED_SAMPLE")
 
@@ -684,9 +686,17 @@ def register_rental_routes(app, connect, require_actor, audit):
                 for match in re.finditer(
                     r"(\w+) (BIGINT|INT|TINYINT|DATE|VARCHAR|TEXT|DECIMAL|BOOLEAN|JSON)"
                     r"(?:\((\d+)(?:,(\d+))?\))?( NOT NULL)?(?=,|\s*$)", TABLE_DEFINITIONS[table], re.M)}
-        for table in editable
+        for table in (*editable, "rent_charges", "payments", "payment_allocations")
     }
     columns["leases"]["cancellation_reason"] = columns["leases"]["termination_reason"]
+    columns["reasons"] = {"reason": ("TEXT", None, None, True)}
+    columns["deposit_event"] = {
+        "amount": columns["payments"]["amount"],
+        "received_date": columns["payments"]["received_date"],
+        "refunded_date": columns["payments"]["received_date"],
+        "payer_name": columns["payments"]["payer_name"],
+        **columns["reasons"],
+    }
     amount_fields = {
         "advertised_rent", "advertised_common_fee", "minimum_fee", "proposed_rent",
         "proposed_common_fee", "rent_amount", "common_fee_amount", "deposit_amount", "key_money_amount",
@@ -1132,6 +1142,8 @@ def register_rental_routes(app, connect, require_actor, audit):
         if table == "leases":
             check_lease_period(db, values)
         row_id = insert(db, actor, table, values)
+        if table == "leases" and values["deposit_amount"]:
+            sync_expected_deposit(db, actor, row_id, values)
         if table == "parties":
             db.execute("UPDATE parties SET party_code=? WHERE tenant_id=? AND id=?",
                        (f"P-{row_id}", TENANT_ID, row_id))
@@ -1213,6 +1225,8 @@ def register_rental_routes(app, connect, require_actor, audit):
         if table == "leases" and row["status"] == "DRAFT":
             require_active_parties(db, table, merged)
             check_lease_period(db, merged)
+            if values.keys() & {"deposit_amount", "start_date"}:
+                sync_expected_deposit(db, actor, row_id, merged)
         update(db, actor, table, row, values)
         if affected and (rows is not None or "end_date" in values):
             refresh_management(db, actor, affected, today)
@@ -1412,7 +1426,7 @@ def register_rental_routes(app, connect, require_actor, audit):
     def charge_types(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
         with connect() as db:
             return db.execute(
-                """SELECT charge_code, charge_name FROM charge_types
+                """SELECT id, charge_code, charge_name FROM charge_types
                    WHERE tenant_id=? AND status='ACTIVE' ORDER BY id LIMIT ? OFFSET ?""", (TENANT_ID, limit, offset),
             ).fetchall()
 
@@ -1454,5 +1468,796 @@ def register_rental_routes(app, connect, require_actor, audit):
     @router.post("/applications/{row_id}/create-lease", status_code=201)
     def create_lease(row_id: int, payload: dict, actor=Depends(require_staff)):
         return write(lambda db: generate_lease(db, actor, row_id, payload))
+
+    def money_values(table, payload, allowed, *, required=()):
+        values = fields(table, payload, allowed.split())
+        for key in required:
+            if values.get(key) is None or values[key] == "":
+                invalid(f"必須項目を入力してください（{key}）")
+        if "amount" in values and (values["amount"] is None or values["amount"] <= 0):
+            invalid("金額は正の整数円を入力してください")
+        return values
+
+    def money_version(payload, row, key="version"):
+        # Existing records always use update()'s version check. A client can
+        # also supply its last read version to check for intervening changes.
+        if key in payload:
+            check_version({"version": payload.pop(key)}, row)
+
+    def month_value(value):
+        if isinstance(value, str) and re.fullmatch(r"\d{4}-\d{2}(-01)?", value):
+            try:
+                month = date.fromisoformat(value[:7] + "-01")
+                if month.year >= 1000:
+                    return month
+            except ValueError:
+                pass
+        invalid("所属月は YYYY-MM または月初日で指定してください")
+
+    def month_end(month):
+        return month.replace(day=monthrange(month.year, month.month)[1])
+
+    def today_jst():
+        return datetime.now(JST).date()
+
+    def require_open_period(db, day):
+        period = day.strftime("%Y-%m")
+        # Use the same period key as close preparation and lock existing snapshots
+        # before testing their state, including a snapshot pending approval.
+        db.execute(
+            "INSERT INTO month_close_period_locks(period) VALUES (?) ON DUPLICATE KEY UPDATE period=period",
+            (period,),
+        )
+        closes = db.execute("SELECT status FROM month_closes WHERE period=? FOR UPDATE", (period,)).fetchall()
+        if any(row["status"] in {"CLOSED", "REOPEN_REQUESTED"} for row in closes):
+            raise HTTPException(423, f"{period} は月次締め済みです")
+
+    def management_for_period(db, unit_id, start, end):
+        # The caller holds the unit lock, which also guards management assignments.
+        rows = db.execute(
+            """SELECT mc.*, cu.valid_from AS assigned_from, cu.valid_to AS assigned_to
+               FROM management_contract_units cu JOIN management_contracts mc
+                 ON mc.tenant_id=cu.tenant_id AND mc.id=cu.management_contract_id
+               WHERE cu.tenant_id=? AND cu.unit_id=? AND mc.status IN ('ACTIVE','ENDED')
+                 AND cu.valid_from<=? AND (cu.valid_to IS NULL OR cu.valid_to>=?)
+                 AND mc.start_date<=? AND (mc.end_date IS NULL OR mc.end_date>=?)""",
+            (TENANT_ID, unit_id, end, start, end, start),
+        ).fetchall()
+        # A regular charge belongs to a single contract. Use the first managed
+        # day in its service period if the assignment changes during the month.
+        eligible = []
+        for row in rows:
+            first = max(start, row["start_date"], row["assigned_from"])
+            last = min(end, row["end_date"] or end, row["assigned_to"] or end)
+            if first <= last:
+                eligible.append((first, row["id"], row))
+        return decode(min(eligible, key=lambda item: item[:2])[2]) if eligible else None
+
+    def sync_expected_deposit(db, actor, lease_id, lease):
+        existing = db.execute(
+            "SELECT * FROM deposits WHERE tenant_id=? AND lease_id=? ORDER BY id FOR UPDATE",
+            (TENANT_ID, lease_id),
+        ).fetchall()
+        amount = lease["deposit_amount"]
+        if existing and any(row["received_amount"] or row["refunded_amount"] or row["transferred_amount"]
+                            for row in existing):
+            if sum(row["agreed_amount"] for row in existing) != amount:
+                invalid("受領済みの敷金額は変更できません")
+            return
+        if not amount and not existing:
+            return
+        contract = None
+        if amount:
+            start = lease["start_date"]
+            contract = management_for_period(db, lease["unit_id"], start, start)
+            if contract is None:
+                invalid("敷金を登録するには契約開始日に有効な管理契約が必要です")
+        values = {
+            "agreed_amount": amount, "status": "EXPECTED" if amount else "CLOSED",
+        }
+        if contract:
+            values.update(management_contract_id=contract["id"], custodian_type=contract["deposit_custodian"])
+        if existing:
+            row = existing[0]
+            if any(row[key] != value for key, value in values.items()):
+                update(db, actor, "deposits", row, values)
+                audit(db, actor.user_id, "rental.deposits.expected_updated", "deposits", row["id"], f"約定額 {amount} 円")
+        else:
+            deposit_id = insert(db, actor, "deposits", dict(
+                values, lease_id=lease_id, received_amount=0, refunded_amount=0, transferred_amount=0,
+            ))
+            audit(db, actor.user_id, "rental.deposits.expected", "deposits", deposit_id, f"約定額 {amount} 円")
+
+    def charge_values(lease, contract, charge_type, month, amount, source, first=None, last=None, due=None):
+        code = charge_type["charge_code"]
+        rule = contract["charge_rule_snapshot"].get(code)
+        if not rule or rule["id"] != charge_type["id"] or rule["beneficiary_type"] not in {"OWNER", "COMPANY"}:
+            return None
+        snapshot = dict(rule)
+        if snapshot["beneficiary_type"] == "OWNER":
+            snapshot["owner_party_id"] = contract["owner_party_id"]
+        key = uuid.uuid4().hex
+        return dict(
+            charge_code=f"C-{key}", lease_id=lease["id"], management_contract_id=contract["id"],
+            charge_type_id=charge_type["id"], service_month=month, service_from=first, service_to=last,
+            due_date=due or month.replace(day=min(lease["payment_due_day"], month_end(month).day)),
+            amount=amount, tax_category=rule["tax_category"], tax_amount=0,
+            beneficiary_snapshot=json.dumps(snapshot), source_type=source,
+            source_reference=key, status="UNPAID",
+        )
+
+    def lease_service_period(lease, month, last_day):
+        first = max(month, lease["actual_move_in_date"] or lease["start_date"])
+        last = min(last_day, lease["actual_move_out_date"] or lease["scheduled_move_out_date"]
+                   or lease["scheduled_end_date"] or last_day)
+        return first, last
+
+    @router.post("/charges/generate")
+    def generate_charges(payload: dict, actor=Depends(require_staff)):
+        if payload.keys() != {"service_month"}:
+            invalid("所属月を指定してください（service_month）")
+        month = month_value(payload["service_month"])
+        last_day = month_end(month)
+
+        def operation(db):
+            require_open_period(db, month)
+            leases = db.execute(
+                """SELECT id, unit_id FROM leases WHERE tenant_id=?
+                   AND status IN ('SIGNED','OCCUPIED','TERMINATION_PENDING','ENDED')
+                   AND COALESCE(actual_move_in_date, start_date)<=?
+                   AND COALESCE(actual_move_out_date, scheduled_move_out_date, scheduled_end_date, ?)>=?
+                   ORDER BY unit_id, id LIMIT 5001""",
+                (TENANT_ID, last_day, last_day, month),
+            ).fetchall()
+            if len(leases) > 5000:
+                invalid("月次生成の対象が上限（5,000契約）を超えています")
+            unit_locks(db, [lease["unit_id"] for lease in leases])
+            types = db.execute(
+                """SELECT id, charge_code FROM charge_types WHERE tenant_id=?
+                   AND charge_code IN ('RENT','COMMON_FEE') ORDER BY id""", (TENANT_ID,),
+            ).fetchall()
+            duplicates = {
+                (row["lease_id"], row["charge_type_id"]) for row in db.execute(
+                    """SELECT lease_id, charge_type_id FROM rent_charges
+                       WHERE tenant_id=? AND service_month=? AND source_type='MONTHLY_RECURRING'""",
+                    (TENANT_ID, month),
+                ).fetchall()
+            }
+            generated = []
+            reasons = {"ALREADY_EXISTS": 0, "NO_MANAGEMENT_CONTRACT": 0, "NO_CHARGE_RULE": 0}
+            excluded_leases = 0
+            for candidate in leases:
+                lease = get(db, "leases", candidate["id"], lock=True)
+                if lease["status"] not in {"SIGNED", "OCCUPIED", "TERMINATION_PENDING", "ENDED"}:
+                    continue
+                first, last = lease_service_period(lease, month, last_day)
+                if first > last:
+                    continue
+                pending = [row for row in types if (lease["id"], row["id"]) not in duplicates]
+                reasons["ALREADY_EXISTS"] += len(types) - len(pending)
+                if not pending:
+                    continue
+                contract = management_for_period(db, lease["unit_id"], first, last)
+                if contract is None:
+                    excluded_leases += 1
+                    reasons["NO_MANAGEMENT_CONTRACT"] += len(pending)
+                    continue
+                for charge_type in pending:
+                    amount = lease["rent_amount" if charge_type["charge_code"] == "RENT" else "common_fee_amount"]
+                    if lease["proration_rule"] == "ACTUAL_DAYS_FLOOR":
+                        amount = amount * ((last - first).days + 1) // last_day.day
+                    values = charge_values(lease, contract, charge_type, month, amount, "MONTHLY_RECURRING", first, last)
+                    if values is None:
+                        reasons["NO_CHARGE_RULE"] += 1
+                    else:
+                        generated.append(insert(db, actor, "rent_charges", values))
+            result = {"service_month": month, "generated_count": len(generated),
+                      "skipped_count": sum(reasons.values()), "skip_reasons": reasons,
+                      "leases_without_management_contract": excluded_leases}
+            if generated:
+                audit(db, actor.user_id, "rental.charges.generated", "rent_charges", None,
+                      f"{month:%Y-%m} {len(generated)} 件 / 請求ID {generated[0]}〜{generated[-1]}")
+            return result
+
+        return write(operation)
+
+    @router.post("/charges", status_code=201)
+    def create_charge(payload: dict, actor=Depends(require_staff)):
+        options = dict(payload)
+        month = month_value(options.pop("service_month", None))
+        values = money_values("rent_charges", options, "lease_id charge_type_id amount due_date",
+                              required=("lease_id", "charge_type_id", "amount"))
+
+        def operation(db):
+            require_open_period(db, month)
+            unit_locks(db, [get(db, "leases", values["lease_id"])["unit_id"]])
+            lease = get(db, "leases", values["lease_id"], lock=True)
+            if lease["status"] in {"DRAFT", "CANCELLED"}:
+                invalid("署名済みの賃貸借契約を指定してください")
+            charge_type = get(db, "charge_types", values["charge_type_id"])
+            if charge_type["status"] != "ACTIVE" or charge_type["recurring"] or charge_type["charge_code"] == "DEPOSIT":
+                invalid("有効な一回性の費目を指定してください。敷金は敷金台帳で管理します")
+            contract = management_for_period(db, lease["unit_id"], month, month_end(month))
+            if contract is None:
+                invalid("対象月に有効な管理契約がありません")
+            charge = charge_values(lease, contract, charge_type, month, values["amount"], "MANUAL",
+                                   due=values.get("due_date"))
+            if charge is None:
+                invalid("管理契約に使用可能な費目ルールがありません")
+            row_id = insert(db, actor, "rent_charges", charge)
+            audit(db, actor.user_id, "rental.charges.created", "rent_charges", row_id, f"{values['amount']} 円")
+            return charge_detail(db, row_id)
+
+        return write(operation)
+
+    allocation_sign = "CASE WHEN reversal_of_id IS NULL THEN amount ELSE -ABS(amount) END"
+
+    def allocated_amount(db, key, row_id):
+        return int(db.execute(
+            f"""SELECT COALESCE(SUM({allocation_sign}),0) AS total
+                FROM payment_allocations WHERE tenant_id=? AND {key}=?""", (TENANT_ID, row_id),
+        ).fetchone()["total"])
+
+    def allocations_for(db, key, row_id, limit=None, offset=0):
+        filters = "a.tenant_id=?"
+        args = [TENANT_ID]
+        if row_id is not None:
+            filters += f" AND a.{key}=?"
+            args.append(row_id)
+        pagination = ""
+        if limit is not None:
+            pagination = " LIMIT ? OFFSET ?"
+            args.extend((limit, offset))
+        return db.execute(
+            f"""SELECT a.*, c.charge_code, p.payment_code,
+                       (SELECT r.id FROM payment_allocations r WHERE r.tenant_id=a.tenant_id
+                        AND r.reversal_of_id=a.id LIMIT 1) AS reversed_by_id
+                FROM payment_allocations a JOIN rent_charges c ON c.tenant_id=a.tenant_id AND c.id=a.charge_id
+                JOIN payments p ON p.tenant_id=a.tenant_id AND p.id=a.payment_id
+                WHERE {filters} ORDER BY a.id DESC{pagination}""", tuple(args),
+        ).fetchall()
+
+    def query_charges(db, *, month=None, lease_id=None, status=None, row_id=None, contract_id=None,
+                      available=False, limit=50, offset=0):
+        restrictions = ["c.tenant_id=?"]
+        args = [TENANT_ID]
+        for column, value in (("service_month", month), ("lease_id", lease_id), ("status", status),
+                              ("id", row_id), ("management_contract_id", contract_id)):
+            if value is not None:
+                restrictions.append(f"c.{column}=?")
+                args.append(value)
+        if available:
+            restrictions.append("c.status IN ('UNPAID','PARTIALLY_PAID') AND c.amount>0")
+        rows = db.execute(
+            f"""SELECT c.*, t.charge_code AS charge_type_code, t.charge_name, l.lease_code,
+                       p.display_name AS tenant_name, COALESCE((SELECT SUM({allocation_sign})
+                         FROM payment_allocations a WHERE a.tenant_id=c.tenant_id AND a.charge_id=c.id),0)
+                         AS allocated_amount
+                FROM rent_charges c
+                JOIN charge_types t ON t.tenant_id=c.tenant_id AND t.id=c.charge_type_id
+                JOIN leases l ON l.tenant_id=c.tenant_id AND l.id=c.lease_id
+                JOIN parties p ON p.tenant_id=l.tenant_id AND p.id=l.tenant_party_id
+                WHERE {' AND '.join(restrictions)}
+                ORDER BY c.service_month DESC, c.id LIMIT ? OFFSET ?""",
+            (*args, limit, offset),
+        ).fetchall()
+        today = today_jst()
+        for row in rows:
+            row.pop("recurring_month", None)
+            row["allocated_amount"] = int(row["allocated_amount"])
+            row["remaining_amount"] = 0 if row["status"] == "CANCELLED" else row["amount"] - row["allocated_amount"]
+            row["overdue_days"] = max(0, (today - row["due_date"]).days) if row["remaining_amount"] > 0 else 0
+            row["beneficiary_snapshot"] = decode(row)["beneficiary_snapshot"]
+        return rows
+
+    def charge_detail(db, row_id):
+        rows = query_charges(db, row_id=row_id)
+        if not rows:
+            raise HTTPException(404, "請求が見つかりません")
+        return dict(rows[0], allocations=allocations_for(db, "charge_id", row_id))
+
+    @router.get("/charges", dependencies=[Depends(require_staff)])
+    def charges(month: str = None, service_month: str = None, lease_id: int = None, status: str = None,
+                payment_id: int = None, limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
+        month = month_value(month or service_month) if month or service_month else None
+        with connect() as db:
+            contract_id = None
+            if payment_id is not None:
+                payment = get(db, "payments", payment_id)
+                if payment["status"] in {"ALLOCATED", "REVERSED"}:
+                    return []
+                contract_id = effective_payment_contract(db, payment)
+            return query_charges(db, month=month, lease_id=lease_id, status=status, contract_id=contract_id,
+                                 available=payment_id is not None, limit=limit, offset=offset)
+
+    @router.get("/charges/overdue", dependencies=[Depends(require_staff)])
+    def overdue_charges(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
+        today = today_jst()
+        with connect() as db:
+            rows = db.execute(
+                f"""SELECT l.id AS lease_id, l.lease_code, p.display_name AS tenant_name,
+                           SUM(c.amount - COALESCE((SELECT SUM({allocation_sign})
+                               FROM payment_allocations a WHERE a.tenant_id=c.tenant_id AND a.charge_id=c.id),0))
+                               AS remaining_amount,
+                           MIN(c.due_date) AS oldest_due_date, COUNT(*) AS charge_count
+                    FROM rent_charges c JOIN leases l ON l.tenant_id=c.tenant_id AND l.id=c.lease_id
+                    JOIN parties p ON p.tenant_id=l.tenant_id AND p.id=l.tenant_party_id
+                    WHERE c.tenant_id=? AND c.status IN ('UNPAID','PARTIALLY_PAID') AND c.due_date<?
+                    GROUP BY l.id,l.lease_code,p.display_name HAVING remaining_amount>0
+                    ORDER BY oldest_due_date,l.id LIMIT ? OFFSET ?""", (TENANT_ID, today, limit, offset),
+            ).fetchall()
+            for row in rows:
+                row["remaining_amount"] = int(row["remaining_amount"])
+                due = row["oldest_due_date"]
+                if isinstance(due, str):
+                    due = date.fromisoformat(due)
+                row["overdue_days"] = (today - due).days
+            return rows
+
+    @router.get("/charges/{row_id}", dependencies=[Depends(require_staff)])
+    def read_charge(row_id: int):
+        with connect() as db:
+            return charge_detail(db, row_id)
+
+    @router.post("/charges/{row_id}/cancel")
+    def cancel_charge(row_id: int, payload: dict, actor=Depends(require_staff)):
+        reason = reversal_reason(payload)
+
+        def operation(db):
+            require_open_period(db, get(db, "rent_charges", row_id)["service_month"])
+            charge = get(db, "rent_charges", row_id, lock=True)
+            options = dict(payload)
+            options.pop("reason")
+            money_version(options, charge)
+            money_values("reasons", options, "")
+            if charge["status"] == "CANCELLED":
+                conflict("この請求は取消済みです")
+            if allocated_amount(db, "charge_id", row_id):
+                invalid("消込済みの請求です。先に消込を取り消してください")
+            update(db, actor, "rent_charges", charge, {"status": "CANCELLED", "cancellation_reason": reason})
+            audit(db, actor.user_id, "rental.charges.cancelled", "rent_charges", row_id, reason)
+            return charge_detail(db, row_id)
+
+        return write(operation)
+    def by_key(db, table, key):
+        return db.execute(f"SELECT * FROM {table} WHERE tenant_id=? AND idempotency_key=?",
+                          (TENANT_ID, key)).fetchone()
+
+    def payment_pool(payment):
+        return "UNIDENTIFIED" if payment["management_contract_id"] is None else "UNALLOCATED"
+
+    def effective_payment_contract(db, payment):
+        if payment["management_contract_id"] is not None:
+            return payment["management_contract_id"]
+        row = db.execute(
+            """SELECT c.management_contract_id FROM payment_allocations a
+               JOIN rent_charges c ON c.tenant_id=a.tenant_id AND c.id=a.charge_id
+               WHERE a.tenant_id=? AND a.payment_id=? AND a.reversal_of_id IS NULL AND NOT EXISTS (
+                 SELECT 1 FROM payment_allocations r WHERE r.tenant_id=a.tenant_id AND r.reversal_of_id=a.id
+               ) LIMIT 1""", (TENANT_ID, payment["id"]),
+        ).fetchone()
+        return row["management_contract_id"] if row else None
+
+    def ledger_entry(db, actor, *, account_id, contract_id, category, entry_type, direction,
+                     amount, posting, source_type, source_id, group, reversal_of_id=None, reason=None):
+        return insert(db, actor, "fund_ledger_entries", dict(
+            entry_code=f"L-{uuid.uuid4().hex}", transaction_group_id=group,
+            fund_account_id=account_id, management_contract_id=contract_id, fund_category=category,
+            entry_type=entry_type, direction=direction, amount=amount, posting_date=posting,
+            accounting_month=posting.replace(day=1), source_type=source_type, source_id=source_id,
+            reversal_of_id=reversal_of_id, reason=reason,
+        ))
+
+    def require_fund_account(account):
+        if account["status"] != "ACTIVE" or not account["is_simulated"] or account["currency"] != "JPY":
+            invalid("有効な円建ての模擬口座を指定してください")
+        return account
+
+    def payment_balance(row):
+        row["allocated_amount"] = int(row["allocated_amount"])
+        row["remaining_amount"] = 0 if row["status"] == "REVERSED" else row["amount"] - row["allocated_amount"]
+        row["unallocated_amount"] = row["remaining_amount"]
+        row["unallocated_category"] = payment_pool(row)
+        return row
+
+    def payment_detail(db, row_id):
+        row = get(db, "payments", row_id)
+        return dict(payment_balance(dict(row, allocated_amount=allocated_amount(db, "payment_id", row_id))),
+                    effective_management_contract_id=effective_payment_contract(db, row),
+                    allocations=allocations_for(db, "payment_id", row_id))
+
+    @router.get("/payments", dependencies=[Depends(require_staff)])
+    def payments(status: str = None, available: bool = False,
+                 limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
+        filters = ["p.tenant_id=?"]
+        args = [TENANT_ID]
+        if status:
+            filters.append("p.status=?")
+            args.append(status)
+        if available:
+            filters.append("p.status IN ('UNALLOCATED','PARTIALLY_ALLOCATED')")
+        with connect() as db:
+            rows = db.execute(
+                f"""SELECT p.*, COALESCE((SELECT SUM({allocation_sign}) FROM payment_allocations a
+                        WHERE a.tenant_id=p.tenant_id AND a.payment_id=p.id),0) AS allocated_amount
+                    FROM payments p WHERE {' AND '.join(filters)}
+                    ORDER BY received_date DESC, id DESC LIMIT ? OFFSET ?""", (*args, limit, offset),
+            ).fetchall()
+            return [payment_balance(row) for row in rows]
+
+    @router.get("/payments/{row_id}", dependencies=[Depends(require_staff)])
+    def read_payment(row_id: int):
+        with connect() as db:
+            return payment_detail(db, row_id)
+
+    @router.post("/payments", status_code=201)
+    def create_payment(payload: dict, actor=Depends(require_staff)):
+        required = "received_date amount payer_name payment_source fund_account_id idempotency_key"
+        values = money_values("payments", payload,
+                              required + " management_contract_id payer_party_id external_reference notes",
+                              required=required.split())
+
+        def operation(db):
+            existing = by_key(db, "payments", values["idempotency_key"])
+            if existing:
+                return payment_detail(db, existing["id"])
+            posting = values["received_date"]
+            if posting > today_jst():
+                invalid("入金日は本日以前の日付を指定してください")
+            require_open_period(db, posting)
+            account = get(db, "fund_accounts", values["fund_account_id"], lock=True)
+            existing = by_key(db, "payments", values["idempotency_key"])
+            if existing:
+                return payment_detail(db, existing["id"])
+            require_fund_account(account)
+            validate_refs(db, "payments", values)
+            contract_id = values.get("management_contract_id")
+            if contract_id is not None and get(db, "management_contracts", contract_id)["status"] not in {"ACTIVE", "ENDED"}:
+                invalid("有効または終了済みの管理契約を指定してください")
+            code = f"P-{uuid.uuid4().hex}"
+            row_id = insert(db, actor, "payments", dict(values, payment_code=code, status="UNALLOCATED"))
+            ledger_entry(db, actor, account_id=account["id"], contract_id=contract_id, category=payment_pool(
+                         {"management_contract_id": contract_id}), entry_type="RECEIPT", direction="IN",
+                         amount=values["amount"], posting=posting, source_type="payment", source_id=row_id, group=code)
+            audit(db, actor.user_id, "rental.payments.created", "payments", row_id, f"{values['amount']} 円")
+            return payment_detail(db, row_id)
+
+        return idempotent_write(operation, "payments", values["idempotency_key"])
+
+    def idempotent_write(operation, table, key):
+        try:
+            return write(operation)
+        except HTTPException as error:
+            if error.status_code != 409:
+                raise
+            # A unique-key race across different parent rows or posting months
+            # rolls back the losing transaction before reading the winner.
+            with connect() as db:
+                existing = by_key(db, table, key)
+                if existing:
+                    if table == "payments":
+                        return payment_detail(db, existing["id"])
+                    return existing
+            raise
+
+    def charge_category(charge):
+        snapshot = decode(charge)["beneficiary_snapshot"]
+        if snapshot["beneficiary_type"] == "COMPANY":
+            return "COMPANY_FUNDS"
+        if snapshot["beneficiary_type"] != "OWNER":
+            invalid("この請求には消込可能な資金区分が設定されていません")
+        code = charge["charge_type_code"]
+        return "OWNER_RENT" if code == "RENT" else "OWNER_OTHER"
+
+    def move_allocation_funds(db, actor, payment, charge, allocation_id, amount, posting, *, original=None, reason=None):
+        group = f"A-{uuid.uuid4().hex}"
+        account = payment["fund_account_id"]
+        if original is None:
+            category = charge_category(charge)
+            legs = [(payment["management_contract_id"], payment_pool(payment), "OUT", None),
+                    (charge["management_contract_id"], category, "IN", None)]
+        else:
+            prior = ledger_for_source(db, "payment_allocation", original["id"])
+            if len(prior) == 1 and prior[0]["direction"] == "IN":
+                # Historic seed rows booked cash directly to the final category.
+                legs = [(prior[0]["management_contract_id"], prior[0]["fund_category"], "OUT", prior[0]["id"]),
+                        (payment["management_contract_id"], payment_pool(payment), "IN", None)]
+            elif len(prior) == 2 and {row["direction"] for row in prior} == {"IN", "OUT"}:
+                legs = [(row["management_contract_id"], row["fund_category"],
+                         "OUT" if row["direction"] == "IN" else "IN", row["id"]) for row in prior]
+            else:
+                conflict("元の消込台帳を確認できません")
+            if any(row["amount"] != amount or row["fund_account_id"] != account for row in prior):
+                conflict("元の消込と台帳が一致しません")
+        for contract_id, category, direction, reversed_id in legs:
+            ledger_entry(db, actor, account_id=account, contract_id=contract_id, category=category,
+                         entry_type="ALLOCATION_REVERSAL" if original else "ALLOCATION",
+                         direction=direction, amount=amount, posting=posting, source_type="payment_allocation",
+                         source_id=allocation_id, group=group, reversal_of_id=reversed_id, reason=reason)
+
+    def ledger_for_source(db, source, row_id):
+        return db.execute(
+            """SELECT * FROM fund_ledger_entries WHERE tenant_id=? AND source_type=? AND source_id=?
+               ORDER BY id""", (TENANT_ID, source, row_id),
+        ).fetchall()
+
+    def update_allocation_status(db, actor, payment, charge, paid, collected):
+        charge_status = "PAID" if collected == charge["amount"] else "PARTIALLY_PAID" if collected else "UNPAID"
+        payment_status = "ALLOCATED" if paid == payment["amount"] else "PARTIALLY_ALLOCATED" if paid else "UNALLOCATED"
+        update(db, actor, "rent_charges", charge, {"status": charge_status})
+        update(db, actor, "payments", payment, {"status": payment_status})
+
+    @router.post("/payments/{row_id}/allocate", status_code=201)
+    def allocate_payment(row_id: int, payload: dict, actor=Depends(require_staff)):
+        options = {key: value for key, value in payload.items() if key in {"version", "payment_version", "charge_version"}}
+        required = "charge_id amount idempotency_key"
+        values = money_values("payment_allocations", {key: value for key, value in payload.items() if key not in options},
+                              required, required=required.split())
+
+        def operation(db):
+            key = values["idempotency_key"]
+            existing = by_key(db, "payment_allocations", key)
+            if existing:
+                return existing
+            posting = today_jst()
+            require_open_period(db, posting)
+            payment = get(db, "payments", row_id, lock=True)
+            existing = by_key(db, "payment_allocations", key)
+            if existing:
+                return existing
+            charge = get(db, "rent_charges", values["charge_id"], lock=True)
+            versions = dict(options)
+            money_version(versions, payment)
+            money_version(versions, payment, "payment_version")
+            money_version(versions, charge, "charge_version")
+            if payment["status"] == "REVERSED" or charge["status"] == "CANCELLED":
+                invalid("取消済みの入金または請求は消し込めません")
+            if payment["received_date"] > posting:
+                invalid("入金日以降に消込してください")
+            contract_id = effective_payment_contract(db, payment)
+            if contract_id is not None and contract_id != charge["management_contract_id"]:
+                invalid("同じ管理契約の請求にのみ消込できます")
+            amount = values["amount"]
+            paid = allocated_amount(db, "payment_id", row_id) + amount
+            if paid > payment["amount"]:
+                invalid("消込額が入金の未消込残高を超えています")
+            collected = allocated_amount(db, "charge_id", charge["id"]) + amount
+            if collected > charge["amount"]:
+                invalid("消込額が請求の未収残高を超えています")
+            allocation_id = insert(db, actor, "payment_allocations", dict(
+                values, payment_id=row_id, allocation_date=posting, allocated_by=actor.user_id,
+            ))
+            charge["charge_type_code"] = get(db, "charge_types", charge["charge_type_id"])["charge_code"]
+            move_allocation_funds(db, actor, payment, charge, allocation_id, amount, posting)
+            update_allocation_status(db, actor, payment, charge, paid, collected)
+            audit(db, actor.user_id, "rental.allocations.created", "payment_allocations", allocation_id,
+                  f"入金 {row_id} / 請求 {charge['id']} / {amount} 円")
+            return get(db, "payment_allocations", allocation_id)
+
+        return idempotent_write(operation, "payment_allocations", values["idempotency_key"])
+
+    def reversal_reason(payload):
+        return money_values("reasons", {"reason": payload.get("reason")}, "reason", required=("reason",))["reason"]
+
+    @router.post("/payment_allocations/{row_id}/reverse")
+    def reverse_allocation(row_id: int, payload: dict, actor=Depends(require_staff)):
+        reason = reversal_reason(payload)
+
+        def operation(db):
+            posting = today_jst()
+            require_open_period(db, posting)
+            original = get(db, "payment_allocations", row_id)
+            payment = get(db, "payments", original["payment_id"], lock=True)
+            charge = get(db, "rent_charges", original["charge_id"], lock=True)
+            options = dict(payload)
+            options.pop("reason")
+            money_version(options, original)
+            money_version(options, payment, "payment_version")
+            money_version(options, charge, "charge_version")
+            money_values("reasons", options, "")
+            if original["reversal_of_id"] is not None or db.execute(
+                "SELECT 1 FROM payment_allocations WHERE tenant_id=? AND reversal_of_id=? LIMIT 1",
+                (TENANT_ID, row_id),
+            ).fetchone():
+                conflict("この消込は取消済み、または取消記録です")
+            if original["allocation_date"] > posting:
+                invalid("消込日以降に取消してください")
+            amount = original["amount"]
+            paid = allocated_amount(db, "payment_id", payment["id"]) - amount
+            collected = allocated_amount(db, "charge_id", charge["id"]) - amount
+            if min(paid, collected) < 0:
+                conflict("有効消込残高と取消額が一致しません")
+            reversing_id = insert(db, actor, "payment_allocations", dict(
+                payment_id=payment["id"], charge_id=charge["id"], allocation_date=posting, amount=amount,
+                allocated_by=actor.user_id, idempotency_key=f"REV-{uuid.uuid4().hex}",
+                reversal_of_id=row_id, reason=reason,
+            ))
+            move_allocation_funds(db, actor, payment, charge, reversing_id, amount, posting, original=original, reason=reason)
+            update_allocation_status(db, actor, payment, charge, paid, collected)
+            audit(db, actor.user_id, "rental.allocations.reversed", "payment_allocations", reversing_id,
+                  f"元の消込 {row_id} / {amount} 円 / {reason}")
+            return get(db, "payment_allocations", reversing_id)
+
+        return write(operation)
+
+    @router.post("/payments/{row_id}/reverse")
+    def reverse_payment(row_id: int, payload: dict, actor=Depends(require_staff)):
+        reason = reversal_reason(payload)
+
+        def operation(db):
+            posting = today_jst()
+            require_open_period(db, posting)
+            payment = get(db, "payments", row_id, lock=True)
+            options = dict(payload)
+            options.pop("reason")
+            money_version(options, payment)
+            money_values("reasons", options, "")
+            if payment["status"] == "REVERSED":
+                conflict("この入金は取消済みです")
+            if payment["received_date"] > posting:
+                invalid("入金日以降に取消してください")
+            if allocated_amount(db, "payment_id", row_id):
+                invalid("消込済みの金額があります。先に消込を取り消してください")
+            receipts = [row for row in ledger_for_source(db, "payment", row_id) if row["direction"] == "IN"]
+            ledger_entry(db, actor, account_id=payment["fund_account_id"], contract_id=payment["management_contract_id"],
+                         category=payment_pool(payment), entry_type="PAYMENT_REVERSAL", direction="OUT",
+                         amount=payment["amount"], posting=posting, source_type="payment", source_id=row_id,
+                         group=f"P-{uuid.uuid4().hex}", reversal_of_id=receipts[0]["id"] if receipts else None, reason=reason)
+            update(db, actor, "payments", payment, {"status": "REVERSED"})
+            audit(db, actor.user_id, "rental.payments.reversed", "payments", row_id, reason)
+            return payment_detail(db, row_id)
+
+        return write(operation)
+
+    @router.get("/payment_allocations", dependencies=[Depends(require_staff)])
+    def payment_allocations(payment_id: int = None, charge_id: int = None,
+                            limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
+        if payment_id is not None and charge_id is not None:
+            invalid("入金または請求のいずれか一方で絞り込んでください")
+        with connect() as db:
+            return allocations_for(db, "charge_id" if charge_id is not None else "payment_id",
+                                   charge_id if charge_id is not None else payment_id, limit, offset)
+    @router.get("/deposits", dependencies=[Depends(require_staff)])
+    def deposits(lease_id: int = None, limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
+        with connect() as db:
+            return db.execute(
+                """SELECT * FROM deposits WHERE tenant_id=? AND (? IS NULL OR lease_id=?)
+                   ORDER BY id DESC LIMIT ? OFFSET ?""", (TENANT_ID, lease_id, lease_id, limit, offset),
+            ).fetchall()
+
+    def deposit_operation(db, actor, row_id, payload, receive):
+        date_key = "received_date" if receive else "refunded_date"
+        note_key = "payer_name" if receive else "reason"
+        options = dict(payload)
+        version = {key: options.pop(key) for key in ("version",) if key in options}
+        values = money_values("deposit_event", options, f"amount {date_key} {note_key}",
+                              required=("amount", date_key, note_key))
+        posting = values[date_key]
+        if posting > today_jst():
+            invalid("実績日は本日以前の日付を指定してください")
+        require_open_period(db, posting)
+        deposit = get(db, "deposits", row_id, lock=True)
+        money_version(version, deposit)
+        amount = values["amount"]
+        received, refunded, transferred = (deposit[key] for key in (
+            "received_amount", "refunded_amount", "transferred_amount",
+        ))
+        if receive:
+            if deposit["status"] not in {"EXPECTED", "PARTIALLY_HELD", "HELD"}:
+                invalid("返還を開始した敷金には受領を追加できません")
+            received += amount
+            if received > deposit["agreed_amount"]:
+                invalid("受領額が敷金の約定額を超えています")
+            status = "HELD" if received == deposit["agreed_amount"] else "PARTIALLY_HELD"
+        else:
+            refunded += amount
+            if refunded + transferred > received:
+                invalid("返還額が敷金の預り残高を超えています")
+            status = "CLOSED" if refunded + transferred == received else "PARTIALLY_RETURNED"
+        if not receive:
+            # A backdated refund must be covered by receipts on its posting date.
+            entries = ledger_for_source(db, "deposit", row_id)
+            running = 0
+            for entry in sorted(entries, key=lambda row: (row["posting_date"], row["id"])):
+                if entry["posting_date"] > posting and running < amount:
+                    invalid("返還日の敷金預り残高が不足しています")
+                running += entry["amount"] if entry["direction"] == "IN" else -entry["amount"]
+            if running < amount:
+                invalid("返還日の敷金預り残高が不足しています")
+        escrow = db.execute("SELECT * FROM fund_accounts WHERE tenant_id=? AND account_code='ESCROW'",
+                            (TENANT_ID,)).fetchone()
+        if escrow is None:
+            invalid("預り金口座がありません")
+        require_fund_account(escrow)
+        note = f"支払者 {values[note_key]}" if receive else values[note_key]
+        ledger_entry(db, actor, account_id=escrow["id"], contract_id=deposit["management_contract_id"],
+                     category="DEPOSIT", entry_type="RECEIPT" if receive else "REFUND",
+                     direction="IN" if receive else "OUT", amount=amount, posting=posting,
+                     source_type="deposit", source_id=row_id, group=f"D-{uuid.uuid4().hex}", reason=note)
+        update(db, actor, "deposits", deposit, {"received_amount": received, "refunded_amount": refunded, "status": status})
+        action = "received" if receive else "refunded"
+        audit(db, actor.user_id, f"rental.deposits.{action}", "deposits", row_id, f"{amount} 円 / {note}")
+        return get(db, "deposits", row_id)
+
+    @router.post("/deposits/{row_id}/receive")
+    def receive_deposit(row_id: int, payload: dict, actor=Depends(require_staff)):
+        return write(lambda db: deposit_operation(db, actor, row_id, payload, True))
+
+    @router.post("/deposits/{row_id}/refund")
+    def refund_deposit(row_id: int, payload: dict, actor=Depends(require_staff)):
+        return write(lambda db: deposit_operation(db, actor, row_id, payload, False))
+
+    fund_categories = ("OWNER_RENT", "OWNER_OTHER", "DEPOSIT", "UNALLOCATED", "UNIDENTIFIED", "COMPANY_FUNDS")
+    signed_entry = "CASE WHEN e.direction='IN' THEN e.amount WHEN e.direction='OUT' THEN -e.amount ELSE 0 END"
+
+    @router.get("/funds/summary", dependencies=[Depends(require_staff)])
+    def funds_summary():
+        with connect() as db:
+            rows = db.execute(
+                f"""SELECT f.id, f.account_code, f.account_name, f.status, e.fund_category,
+                           COALESCE(SUM({signed_entry}),0) AS balance
+                    FROM fund_accounts f LEFT JOIN fund_ledger_entries e
+                      ON e.tenant_id=f.tenant_id AND e.fund_account_id=f.id
+                    WHERE f.tenant_id=?
+                    GROUP BY f.id,f.account_code,f.account_name,f.status,e.fund_category ORDER BY f.id""",
+                (TENANT_ID,),
+            ).fetchall()
+        accounts = {}
+        categories = dict.fromkeys(fund_categories, 0)
+        for row in rows:
+            account = accounts.setdefault(row["id"], {
+                key: row[key] for key in ("id", "account_code", "account_name", "status")
+            } | {"balance": 0})
+            balance = int(row["balance"])
+            account["balance"] += balance
+            if row["account_code"] == "ESCROW" and row["fund_category"] in categories:
+                categories[row["fund_category"]] = balance
+        escrow_balance = next((row["balance"] for row in accounts.values() if row["account_code"] == "ESCROW"), 0)
+        return {"accounts": list(accounts.values()), "escrow_categories": categories,
+                "reconciliation_difference": escrow_balance - sum(categories.values())}
+
+    @router.get("/funds/ledger", dependencies=[Depends(require_staff)])
+    def funds_ledger(fund_account_id: int = None, category: str = None, month: str = None,
+                     limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
+        filters = ["tenant_id=?"]
+        args = [TENANT_ID]
+        for column, value in (("fund_account_id", fund_account_id), ("fund_category", category),
+                              ("accounting_month", month_value(month) if month else None)):
+            if value is not None:
+                filters.append(f"{column}=?")
+                args.append(value)
+        with connect() as db:
+            return db.execute(
+                f"""SELECT * FROM fund_ledger_entries WHERE {' AND '.join(filters)}
+                    ORDER BY posting_date DESC,id DESC LIMIT ? OFFSET ?""", (*args, limit, offset),
+            ).fetchall()
+
+    @router.get("/funds/by-contract", dependencies=[Depends(require_staff)])
+    def funds_by_contract(month: str, limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
+        service_month = month_value(month)
+        with connect() as db:
+            rows = db.execute(
+                f"""SELECT mc.id AS management_contract_id, mc.contract_code,
+                    SUM(CASE WHEN e.fund_category IN ('OWNER_RENT','OWNER_OTHER') AND e.accounting_month<? THEN {signed_entry} ELSE 0 END) AS opening_balance,
+                    SUM(CASE WHEN e.fund_category IN ('OWNER_RENT','OWNER_OTHER') AND e.accounting_month=? AND e.direction='IN' THEN e.amount ELSE 0 END) AS monthly_in,
+                    SUM(CASE WHEN e.fund_category IN ('OWNER_RENT','OWNER_OTHER') AND e.accounting_month=? AND e.direction='OUT' THEN e.amount ELSE 0 END) AS monthly_out,
+                    SUM(CASE WHEN e.fund_category='DEPOSIT' AND e.accounting_month<? THEN {signed_entry} ELSE 0 END) AS deposit_opening_balance,
+                    SUM(CASE WHEN e.fund_category='DEPOSIT' AND e.accounting_month=? AND e.direction='IN' THEN e.amount ELSE 0 END) AS deposit_monthly_in,
+                    SUM(CASE WHEN e.fund_category='DEPOSIT' AND e.accounting_month=? AND e.direction='OUT' THEN e.amount ELSE 0 END) AS deposit_monthly_out
+                    FROM management_contracts mc LEFT JOIN fund_ledger_entries e
+                      ON e.tenant_id=mc.tenant_id AND e.management_contract_id=mc.id AND e.accounting_month<=?
+                      AND e.fund_category IN ('OWNER_RENT','OWNER_OTHER','DEPOSIT')
+                    WHERE mc.tenant_id=? AND mc.status IN ('ACTIVE','ENDED')
+                      AND (mc.start_date<=? OR e.id IS NOT NULL)
+                    GROUP BY mc.id,mc.contract_code ORDER BY mc.id LIMIT ? OFFSET ?""",
+                (*([service_month] * 7), TENANT_ID, month_end(service_month), limit, offset),
+            ).fetchall()
+        for row in rows:
+            for prefix in ("", "deposit_"):
+                keys = [prefix + key for key in ("opening_balance", "monthly_in", "monthly_out")]
+                opening, incoming, outgoing = (int(row[key]) for key in keys)
+                row.update(zip(keys, (opening, incoming, outgoing)))
+                row[prefix + "closing_balance"] = opening + incoming - outgoing
+        return {"month": service_month, "items": rows}
 
     app.include_router(router)

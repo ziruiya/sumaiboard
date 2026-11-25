@@ -811,7 +811,7 @@
   border-top: 1px solid #e2e8f0;
 }
 
-.rental-list-button {
+.rental-list-button, .rental-money-row {
   display: flex;
   flex-wrap: wrap;
   justify-content: space-between;
@@ -823,14 +823,19 @@
   color: inherit;
   background: transparent;
   border: 0;
+  overflow-wrap: anywhere;
+}
+
+.rental-list-button {
   cursor: pointer;
 }
 
+.rental-list-button[aria-pressed="true"],
 .rental-list-button:hover {
   background: #f1f5f9;
 }
 
-.rental-list-button small {
+.rental-list-button small, .rental-money-row small {
   display: block;
 }
 

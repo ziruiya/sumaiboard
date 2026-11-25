@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { todayJst } from "./jst-date.js";
 
 export const rentalPages = [
   ["dashboard", "ダッシュボード"],
@@ -80,7 +81,9 @@ export default function RentalPage({ page, apiBase }) {
     {page === "dashboard" ? <RentalDashboard apiBase={apiBase}/>
       : page === "properties" ? <RentalProperties apiBase={apiBase}/>
         : page === "applications" ? <RentalPipeline apiBase={apiBase}/>
-          : <p className="panel">準備中</p>}
+          : page === "rent" ? <RentalRent apiBase={apiBase}/>
+            : page === "funds" ? <RentalFunds apiBase={apiBase}/>
+              : <p className="panel">準備中</p>}
   </section>;
 }
 
@@ -604,4 +607,308 @@ function RentalProperties({ apiBase }) {
 
 function RentalPipeline({ apiBase }) {
   return <RentalWorkspace apiBase={apiBase} tabs={["applications", "leases"]} pipeline/>;
+}
+
+const moneyStatuses = {
+  UNPAID: "未収", PARTIALLY_PAID: "一部入金", PAID: "入金済み", CANCELLED: "取消済み",
+  UNALLOCATED: "未消込", PARTIALLY_ALLOCATED: "一部消込", ALLOCATED: "消込済み", REVERSED: "取消済み",
+};
+
+const fundCategoryNames = {
+  OWNER_RENT: "オーナー家賃", OWNER_OTHER: "オーナーその他収入", DEPOSIT: "敷金預り",
+  UNALLOCATED: "未消込", UNIDENTIFIED: "未識別", COMPANY_FUNDS: "自社資金",
+};
+
+function useMoneyAction(apiBase) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  async function submit(path, payload, done) {
+    setBusy(true);
+    setError("");
+    try {
+      const response = await fetch(`${apiBase}/api/rental/${path}`, {
+        method: "POST", credentials: "include",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setError(typeof data.detail === "string" ? data.detail : "入力内容を確認してください。");
+        return;
+      }
+      done(data);
+    } catch {
+      setError("通信状況を確認して再試行してください。");
+    } finally {
+      setBusy(false);
+    }
+  }
+  return { busy, error, submit };
+}
+
+function MoneyError({ action, refresh }) {
+  if (!action.error) return null;
+  return <p role="alert" className="rental-error">{action.error}
+    {refresh && <button type="button" className="secondary-btn" onClick={refresh}>再読み込み</button>}
+  </p>;
+}
+
+function MoneyList({ rows, render, empty = "表示できるデータがありません。" }) {
+  return rows.length ? <ul className="panel rental-list">{rows.map((row) =>
+    <li key={row.id ?? row.lease_id}>{render(row)}</li>)}</ul> : <p>{empty}</p>;
+}
+
+function MoneyRow({ title, description, balance, onClick, selected, actionLabel }) {
+  const contents = <>
+    <span><strong>{title}</strong><small>{description}</small></span><span>{balance}{onClick && actionLabel && <small>{actionLabel}</small>}</span>
+  </>;
+  return onClick
+    ? <button type="button" className="rental-list-button" onClick={onClick} aria-pressed={selected}>{contents}</button>
+    : <div className="rental-money-row">{contents}</div>;
+}
+
+function MoneyReasonForm({ apiBase, path, title, versions, saved, close, refresh }) {
+  const action = useMoneyAction(apiBase);
+  const [reason, setReason] = useState("");
+  return <form className="panel rental-form" onSubmit={(event) => {
+    event.preventDefault();
+    action.submit(path, { ...versions, reason }, saved);
+  }}>
+    <h3>{title}</h3>
+    <div className="rental-fields">
+      <label>取消理由<input required value={reason} onChange={(event) => setReason(event.target.value)}/></label>
+    </div>
+    <MoneyError action={action} refresh={refresh}/>
+    <div className="rental-controls">
+      <button className="primary-btn" disabled={action.busy || !reason.trim()}>取消を確定</button>
+      <button type="button" className="secondary-btn" disabled={action.busy} onClick={close}>戻る</button>
+    </div>
+  </form>;
+}
+
+function RentCharges({ apiBase }) {
+  const [month, setMonth] = useState(() => todayJst().slice(0, 7));
+  const [offset, setOffset] = useState(0);
+  const [generated, setGenerated] = useState(null);
+  const [cancel, setCancel] = useState(null);
+  const action = useMoneyAction(apiBase);
+  const data = useRentalData(apiBase, `charges?month=${month}&offset=${offset}`);
+  return <div className="rental-stack">
+    <div className="rental-controls">
+      <label>所属月 <input type="month" value={month} onChange={(event) => {
+        setMonth(event.target.value);
+        setOffset(0);
+        setGenerated(null);
+        setCancel(null);
+      }}/></label>
+      <button type="button" className="primary-btn" disabled={!month || action.busy}
+        onClick={() => action.submit("charges/generate", { service_month: month }, (result) => {
+          setGenerated(result);
+          data.retry();
+        })}>月次請求を生成</button>
+    </div>
+    {generated?.service_month.slice(0, 7) === month && <p role="status">
+      {generated.generated_count} 件生成・{generated.skipped_count} 件スキップ
+      {generated.leases_without_management_contract > 0 && `（管理契約のない賃貸借契約 ${generated.leases_without_management_contract} 件）`}
+    </p>}
+    <MoneyError action={action}/>
+    {cancel && <MoneyReasonForm key={cancel.id} apiBase={apiBase}
+      path={`charges/${cancel.id}/cancel`} title={`請求取消 ${cancel.charge_code}`}
+      versions={{ version: cancel.version }} close={() => setCancel(null)}
+      refresh={() => { setCancel(null); data.retry(); }}
+      saved={() => { setCancel(null); data.retry(); }}/>}
+    {month && <RentalResult result={data}>{(rows) => <>
+      <MoneyList rows={rows} render={(row) => <MoneyRow
+        title={`${row.tenant_name} · ${row.charge_name}`}
+        description={`${row.lease_code} · 期限 ${row.due_date} · 請求 ${yen.format(row.amount)} · ${moneyStatuses[row.status]}`}
+        balance={`未収 ${yen.format(row.remaining_amount)}`}
+        onClick={!row.allocated_amount && row.status === "UNPAID" ? () => setCancel(row) : undefined}
+        selected={cancel?.id === row.id}
+        actionLabel="請求を取り消す"
+      />}/>
+      <Pager offset={offset} count={rows.length} setOffset={setOffset}/>
+    </>}</RentalResult>}
+  </div>;
+}
+
+function RentPaymentRegistration({ apiBase, saved }) {
+  const funds = useRentalData(apiBase, "funds/summary");
+  const action = useMoneyAction(apiBase);
+  const [contract, setContract] = useState(null);
+  const [retry, setRetry] = useState(null);
+  return <RentalResult result={funds}>{({ accounts }) => <form className="panel rental-form" onSubmit={(event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const values = Object.fromEntries(new FormData(form));
+    const payload = { ...values, amount: Number(values.amount), fund_account_id: Number(values.fund_account_id),
+      management_contract_id: contract };
+    const signature = JSON.stringify(payload);
+    const key = retry?.signature === signature ? retry.key : crypto.randomUUID();
+    setRetry({ signature, key });
+    action.submit("payments", { ...payload, idempotency_key: key }, (payment) => {
+      setRetry(null);
+      setContract(null);
+      form.reset();
+      saved(payment);
+    });
+  }}>
+    <h2>入金登録</h2>
+    <div className="rental-fields">
+      <label>入金日<input type="date" name="received_date" required defaultValue={todayJst()}/></label>
+      <label>入金額（円）<input type="number" name="amount" min="1" max={Number.MAX_SAFE_INTEGER} required/></label>
+      <label>支払者<input name="payer_name" maxLength="200" required/></label>
+      <label>入金元<select name="payment_source">
+        <option value="TENANT">入居者</option><option value="GUARANTOR_COMPANY">保証会社</option><option value="OTHER">その他</option>
+      </select></label>
+      <label>入金口座<select name="fund_account_id" required
+        defaultValue={accounts.find((account) => account.account_code === "ESCROW")?.id}>
+        {accounts.filter((account) => account.status === "ACTIVE").map((account) =>
+          <option key={account.id} value={account.id}>{account.account_name}</option>)}
+      </select></label>
+      <ReferenceField apiBase={apiBase} label="管理契約（未識別の場合は空欄）" resource="management-contracts"
+        optional value={contract} setValue={setContract}/>
+    </div>
+    <MoneyError action={action}/>
+    <button className="primary-btn" disabled={action.busy}>入金を登録</button>
+  </form>}</RentalResult>;
+}
+
+function RentPayments({ apiBase, selected, select }) {
+  const [offset, setOffset] = useState(0);
+  const [registered, setRegistered] = useState(null);
+  const result = useRentalData(apiBase, `payments?offset=${offset}`);
+  return <div className="rental-stack">
+    {!select && <RentPaymentRegistration apiBase={apiBase} saved={(row) => {
+      setRegistered(row);
+      setOffset(0);
+      result.retry();
+    }}/>}
+    {registered && <p role="status">{registered.payer_name}の入金 {yen.format(registered.amount)} を登録しました。</p>}
+    <RentalResult result={result}>{(rows) => <>
+      <MoneyList rows={rows} render={(row) => <MoneyRow title={row.payer_name}
+        description={`${row.received_date} · ${yen.format(row.amount)} · ${moneyStatuses[row.status]}`}
+        balance={`未消込 ${yen.format(row.remaining_amount)}`}
+        onClick={select ? () => select(row.id) : undefined} selected={selected === row.id}/>}/>
+      <Pager offset={offset} count={rows.length} setOffset={setOffset}/>
+    </>}</RentalResult>
+  </div>;
+}
+
+function RentAllocationForm({ apiBase, payment, charge, saved }) {
+  const action = useMoneyAction(apiBase);
+  const [retry, setRetry] = useState(null);
+  const cap = Math.min(payment.remaining_amount, charge.remaining_amount, Number.MAX_SAFE_INTEGER);
+  return <form className="panel rental-form" onSubmit={(event) => {
+    event.preventDefault();
+    const amount = Number(new FormData(event.currentTarget).get("amount"));
+    const key = retry?.amount === amount ? retry.key : crypto.randomUUID();
+    setRetry({ amount, key });
+    action.submit(`payments/${payment.id}/allocate`, { charge_id: charge.id, amount, idempotency_key: key,
+      payment_version: payment.version, charge_version: charge.version }, saved);
+  }}>
+    <h3>{charge.tenant_name} · {charge.charge_name}</h3>
+    <p>入金の未消込 {yen.format(payment.remaining_amount)} · 請求の未収 {yen.format(charge.remaining_amount)}</p>
+    <div className="rental-fields">
+      <label>消込額（円）<input name="amount" type="number" required min="1" max={cap}/></label>
+    </div>
+    <MoneyError action={action} refresh={saved}/>
+    <button className="primary-btn" disabled={action.busy || cap <= 0}>消込を登録</button>
+  </form>;
+}
+
+function RentAllocationDetail({ apiBase, paymentId, close }) {
+  const [offset, setOffset] = useState(0);
+  const [charge, setCharge] = useState(null);
+  const [reversal, setReversal] = useState(null);
+  const payment = useRentalData(apiBase, `payments/${paymentId}`);
+  const charges = useRentalData(apiBase, `charges?payment_id=${paymentId}&offset=${offset}`);
+  function refresh() {
+    setCharge(null);
+    setReversal(null);
+    payment.retry();
+    charges.retry();
+  }
+  return <RentalResult result={payment}>{(row) => <div className="rental-stack">
+    <button type="button" className="secondary-btn" onClick={close}>入金一覧に戻る</button>
+    <div className="panel">
+      <h2>{row.payer_name}</h2>
+      <p>{row.received_date} · {moneyStatuses[row.status]} · 未消込 <strong>{yen.format(row.remaining_amount)}</strong></p>
+    </div>
+    {row.remaining_amount > 0 && <>
+      <h3>消込可能な請求</h3>
+      <RentalResult result={charges}>{(rows) => <>
+        <MoneyList rows={rows} empty="消込可能な請求がありません。" render={(item) => <MoneyRow
+          title={`${item.tenant_name} · ${item.charge_name}`}
+          description={`${item.lease_code} · ${item.service_month.slice(0, 7)} · 期限 ${item.due_date}`}
+          balance={`未収 ${yen.format(item.remaining_amount)}`}
+          onClick={() => { setCharge(item); setReversal(null); }} selected={charge?.id === item.id}/>}/>
+        <Pager offset={offset} count={rows.length} setOffset={setOffset}/>
+      </>}</RentalResult>
+    </>}
+    {charge && <RentAllocationForm key={charge.id} apiBase={apiBase} payment={row} charge={charge} saved={refresh}/>}
+    <h3>消込履歴</h3>
+    <MoneyList rows={row.allocations} empty="消込履歴がありません。" render={(item) => <MoneyRow title={item.charge_code}
+      description={`${item.allocation_date} · ${item.reversal_of_id ? "取消記録" : item.reversed_by_id ? "取消済み" : "消込済み"}`}
+      balance={yen.format(item.reversal_of_id ? -item.amount : item.amount)}
+      onClick={!item.reversal_of_id && !item.reversed_by_id ? () => { setReversal(item); setCharge(null); } : undefined}
+      selected={reversal?.id === item.id}/>}/>
+    {row.status === "UNALLOCATED" && <button type="button" className="secondary-btn"
+      onClick={() => { setReversal(row); setCharge(null); }}>入金を取り消す</button>}
+    {reversal && <MoneyReasonForm key={reversal.charge_id ? reversal.id : "payment"} apiBase={apiBase}
+      path={!reversal.charge_id ? `payments/${row.id}/reverse`
+        : `payment_allocations/${reversal.id}/reverse`}
+      title={reversal.charge_id ? "消込取消" : "入金取消"}
+      versions={reversal.charge_id ? { version: reversal.version, payment_version: row.version } : { version: row.version }}
+      saved={refresh} refresh={refresh} close={() => setReversal(null)}/>}
+  </div>}</RentalResult>;
+}
+
+function RentAllocation({ apiBase }) {
+  const [paymentId, setPaymentId] = useState(null);
+  return paymentId === null ? <RentPayments apiBase={apiBase} select={setPaymentId}/>
+    : <RentAllocationDetail key={paymentId} apiBase={apiBase} paymentId={paymentId} close={() => setPaymentId(null)}/>;
+}
+
+function RentOverdue({ apiBase }) {
+  const [offset, setOffset] = useState(0);
+  const result = useRentalData(apiBase, `charges/overdue?offset=${offset}`);
+  return <RentalResult result={result}>{(rows) => <>
+    <MoneyList rows={rows} empty="期限超過の未収請求はありません。" render={(row) => <MoneyRow
+      title={`${row.tenant_name} · ${row.lease_code}`}
+      description={`最も古い期限から ${row.overdue_days} 日超過 · ${row.charge_count} 件`}
+      balance={yen.format(row.remaining_amount)}/>}/>
+    <Pager offset={offset} count={rows.length} setOffset={setOffset}/>
+  </>}</RentalResult>;
+}
+
+function RentalRent({ apiBase }) {
+  const [view, setView] = useState("請求");
+  const views = { "請求": RentCharges, "入金": RentPayments, "消込": RentAllocation, "滞納": RentOverdue };
+  const View = views[view];
+  return <div className="rental-stack">
+    <nav className="rental-controls" aria-label="家賃収納の表示対象">
+      {Object.keys(views).map((label) => <button type="button" className="secondary-btn"
+        key={label} aria-pressed={view === label} onClick={() => setView(label)}>{label}</button>)}
+    </nav>
+    <View apiBase={apiBase}/>
+  </div>;
+}
+
+function RentalFunds({ apiBase }) {
+  const result = useRentalData(apiBase, "funds/summary");
+  return <RentalResult result={result}>{(data) => <div className="rental-stack">
+    <div className="rental-metrics">
+      {data.accounts.map((account) => <div className="panel rental-metric" key={account.id}>
+        <span>{account.account_name}</span><strong>{yen.format(account.balance)}</strong>
+      </div>)}
+      <div className={`panel rental-metric${data.reconciliation_difference ? " rental-error" : ""}`}
+        role={data.reconciliation_difference ? "alert" : undefined}>
+        <span>照合差額</span><strong>{yen.format(data.reconciliation_difference)}</strong>
+      </div>
+    </div>
+    <div className="panel">
+      <h2>預り金口座の内訳</h2>
+      <RecordValues row={data.escrow_categories}
+        fields={Object.entries(fundCategoryNames).map(([key, label]) => [key, label, "money"])}/>
+    </div>
+  </div>}</RentalResult>;
 }
