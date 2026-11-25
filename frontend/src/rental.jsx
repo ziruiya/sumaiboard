@@ -666,12 +666,19 @@ function MoneyRow({ title, description, balance, onClick, selected, actionLabel 
     : <div className="rental-money-row">{contents}</div>;
 }
 
-function MoneyReasonForm({ apiBase, path, title, versions, saved, close, refresh }) {
+function MoneyReasonForm({ apiBase, path, title, versions, saved, close, refresh, idempotent = false }) {
   const action = useMoneyAction(apiBase);
   const [reason, setReason] = useState("");
+  const [retry, setRetry] = useState(null);
   return <form className="panel rental-form" onSubmit={(event) => {
     event.preventDefault();
-    action.submit(path, { ...versions, reason }, saved);
+    const payload = { ...versions, reason: reason.trim() };
+    if (idempotent) {
+      const key = retry?.reason === payload.reason ? retry.key : crypto.randomUUID();
+      setRetry({ reason: payload.reason, key });
+      payload.idempotency_key = key;
+    }
+    action.submit(path, payload, saved);
   }}>
     <h3>{title}</h3>
     <div className="rental-fields">
@@ -861,7 +868,9 @@ function RentAllocationDetail({ apiBase, paymentId, close }) {
       path={!reversal.charge_id ? `payments/${row.id}/reverse`
         : `payment_allocations/${reversal.id}/reverse`}
       title={reversal.charge_id ? "消込取消" : "入金取消"}
-      versions={reversal.charge_id ? { version: reversal.version, payment_version: row.version } : { version: row.version }}
+      idempotent={Boolean(reversal.charge_id)}
+      versions={reversal.charge_id ? { allocation_version: reversal.version, payment_version: row.version,
+        charge_version: reversal.charge_version } : { version: row.version }}
       saved={refresh} refresh={refresh} close={() => setReversal(null)}/>}
   </div>}</RentalResult>;
 }
@@ -993,6 +1002,11 @@ function RentalFunds({ apiBase }) {
         id: `${row.management_contract_id}-${key}`, contractId: row.management_contract_id,
         label, amount: row[key].difference,
       })));
+    const independentChecks = { unidentified: "未識別資金", company_funds: "自社資金" };
+    for (const [key, label] of Object.entries(independentChecks)) {
+      const { difference } = data.independent_reconciliation[key];
+      if (difference !== 0) differences.push({ id: key, label, amount: difference });
+    }
     return <div className="rental-stack">
       <div className="rental-metrics">
         {data.accounts.map((account) => <div className="panel rental-metric" key={account.id}>
@@ -1012,8 +1026,8 @@ function RentalFunds({ apiBase }) {
       <div className="panel">
         <h2>業務データとの照合</h2>
         {differences.length ? <ul className="rental-error" role="alert">{differences.map((row) =>
-          <li key={row.id}>管理契約 ID {row.contractId} · {row.label}の差額 {yen.format(row.amount)}</li>)}</ul>
-          : <p>全 {data.business_reconciliation.length} 契約の照合差額 {yen.format(0)}</p>}
+          <li key={row.id}>{row.contractId && `管理契約 ID ${row.contractId} · `}{row.label}の差額 {yen.format(row.amount)}</li>)}</ul>
+          : <p>全 {data.business_reconciliation.length} 契約・未識別資金・自社資金の照合差額 {yen.format(0)}</p>}
       </div>
     </div>;
   }}</RentalResult>;

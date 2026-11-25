@@ -1484,6 +1484,13 @@ def register_rental_routes(app, connect, require_actor, audit):
         if key in payload:
             check_version({"version": payload.pop(key)}, row)
 
+    def allocation_versions(payload, *keys):
+        versions = {key: payload.get(key) for key in keys}
+        for key, version in versions.items():
+            if type(version) is not int or version < 1:
+                invalid(f"正の整数の version を指定してください（{key}）")
+        return versions
+
     def month_value(value):
         if isinstance(value, str) and re.fullmatch(r"\d{4}-\d{2}(-01)?", value):
             try:
@@ -1734,7 +1741,7 @@ def register_rental_routes(app, connect, require_actor, audit):
             pagination = " LIMIT ? OFFSET ?"
             args.extend((limit, offset))
         return db.execute(
-            f"""SELECT a.*, c.charge_code, p.payment_code,
+            f"""SELECT a.*, c.charge_code, c.version AS charge_version, p.payment_code,
                        (SELECT r.id FROM payment_allocations r WHERE r.tenant_id=a.tenant_id
                         AND r.reversal_of_id=a.id LIMIT 1) AS reversed_by_id
                 FROM payment_allocations a JOIN rent_charges c ON c.tenant_id=a.tenant_id AND c.id=a.charge_id
@@ -2038,9 +2045,9 @@ def register_rental_routes(app, connect, require_actor, audit):
 
     @router.post("/payments/{row_id}/allocate", status_code=201)
     def allocate_payment(row_id: int, payload: dict, actor=Depends(require_staff)):
-        options = {key: value for key, value in payload.items() if key in {"version", "payment_version", "charge_version"}}
+        versions = allocation_versions(payload, "payment_version", "charge_version")
         required = "charge_id amount idempotency_key"
-        values = money_values("payment_allocations", {key: value for key, value in payload.items() if key not in options},
+        values = money_values("payment_allocations", {key: value for key, value in payload.items() if key not in versions},
                               required, required=required.split())
 
         parameters = dict(values, payment_id=row_id, reversal_of_id=None)
@@ -2059,10 +2066,8 @@ def register_rental_routes(app, connect, require_actor, audit):
             if get(db, "fund_accounts", payment["fund_account_id"])["account_code"] != "ESCROW":
                 invalid("預り金口座の入金のみ消込できます")
             charge = get(db, "rent_charges", values["charge_id"], lock=True)
-            versions = dict(options)
-            money_version(versions, payment)
-            money_version(versions, payment, "payment_version")
-            money_version(versions, charge, "charge_version")
+            check_version({"version": versions["payment_version"]}, payment)
+            check_version({"version": versions["charge_version"]}, charge)
             if payment["status"] == "REVERSED" or charge["status"] == "CANCELLED":
                 invalid("取消済みの入金または請求は消し込めません")
             if payment["received_date"] > posting:
@@ -2094,22 +2099,28 @@ def register_rental_routes(app, connect, require_actor, audit):
 
     @router.post("/payment_allocations/{row_id}/reverse")
     def reverse_allocation(row_id: int, payload: dict, actor=Depends(require_staff)):
-        if payload.get("version") is None:
-            invalid("version を指定してください")
-        reason = reversal_reason(payload)
+        versions = allocation_versions(payload, "allocation_version", "payment_version", "charge_version")
+        values = money_values("payment_allocations", {key: value for key, value in payload.items() if key not in versions},
+                              "reason idempotency_key", required=("reason",))
+        reason = values["reason"]
+        key = values.get("idempotency_key", f"REV-{uuid.uuid4().hex}")
+        parameters = {"idempotency_key": key, "reversal_of_id": row_id, "reason": reason}
 
         def operation(db):
+            existing = by_key(db, "payment_allocations", key)
+            if existing:
+                return idempotent_result(db, "payment_allocations", existing, parameters)
             posting = today_jst()
             require_open_period(db, posting)
             original = get(db, "payment_allocations", row_id)
             payment = get(db, "payments", original["payment_id"], lock=True)
             charge = get(db, "rent_charges", original["charge_id"], lock=True)
-            options = dict(payload)
-            options.pop("reason")
-            money_version(options, original)
-            money_version(options, payment, "payment_version")
-            money_version(options, charge, "charge_version")
-            money_values("reasons", options, "")
+            existing = by_key(db, "payment_allocations", key)
+            if existing:
+                return idempotent_result(db, "payment_allocations", existing, parameters)
+            check_version({"version": versions["allocation_version"]}, original)
+            check_version({"version": versions["payment_version"]}, payment)
+            check_version({"version": versions["charge_version"]}, charge)
             if original["reversal_of_id"] is not None or db.execute(
                 "SELECT 1 FROM payment_allocations WHERE tenant_id=? AND reversal_of_id=? LIMIT 1",
                 (TENANT_ID, row_id),
@@ -2124,7 +2135,7 @@ def register_rental_routes(app, connect, require_actor, audit):
                 conflict("有効消込残高と取消額が一致しません")
             reversing_id = insert(db, actor, "payment_allocations", dict(
                 payment_id=payment["id"], charge_id=charge["id"], allocation_date=posting, amount=amount,
-                allocated_by=actor.user_id, idempotency_key=f"REV-{uuid.uuid4().hex}",
+                allocated_by=actor.user_id, idempotency_key=key,
                 reversal_of_id=row_id, reason=reason,
             ))
             move_allocation_funds(db, actor, payment, charge, reversing_id, amount, posting, original=original, reason=reason)
@@ -2133,7 +2144,7 @@ def register_rental_routes(app, connect, require_actor, audit):
                   f"元の消込 {row_id} / {amount} 円 / {reason}")
             return get(db, "payment_allocations", reversing_id)
 
-        return write(operation)
+        return idempotent_write(operation, "payment_allocations", parameters)
 
     @router.post("/payments/{row_id}/reverse")
     def reverse_payment(row_id: int, payload: dict, actor=Depends(require_staff)):
@@ -2273,17 +2284,22 @@ def register_rental_routes(app, connect, require_actor, audit):
                 ), payment_usage AS (
                     SELECT payment_id, SUM(amount) AS used_amount FROM active_allocations GROUP BY payment_id
                 ), business_amounts AS (
-                    SELECT p.management_contract_id AS contract_id, 'unallocated' AS source,
+                    SELECT p.management_contract_id AS contract_id,
+                           CASE WHEN p.management_contract_id IS NULL THEN 'unidentified' ELSE 'unallocated' END AS source,
                            p.amount-COALESCE(u.used_amount,0) AS amount
                     FROM payments p LEFT JOIN payment_usage u ON u.payment_id=p.id
-                    WHERE p.tenant_id=? AND p.status<>'REVERSED' AND p.management_contract_id IS NOT NULL
+                    WHERE p.tenant_id=? AND p.status<>'REVERSED'
                     UNION ALL
-                    SELECT management_contract_id, 'deposit', received_amount-refunded_amount
+                    SELECT management_contract_id, 'deposit', received_amount-refunded_amount-transferred_amount
                     FROM deposits WHERE tenant_id=?
                     UNION ALL
                     SELECT c.management_contract_id, 'owner_allocation', a.amount
                     FROM active_allocations a JOIN rent_charges c ON c.id=a.charge_id AND c.tenant_id=?
                     WHERE JSON_UNQUOTE(JSON_EXTRACT(c.beneficiary_snapshot,'$.beneficiary_type'))='OWNER'
+                    UNION ALL
+                    SELECT NULL, 'company_funds', a.amount
+                    FROM active_allocations a JOIN rent_charges c ON c.id=a.charge_id AND c.tenant_id=?
+                    WHERE JSON_UNQUOTE(JSON_EXTRACT(c.beneficiary_snapshot,'$.beneficiary_type'))='COMPANY'
                 ), totals AS (
                     SELECT contract_id, source, SUM(amount) AS business_amount, 0 AS ledger_amount
                     FROM business_amounts GROUP BY contract_id,source
@@ -2297,24 +2313,40 @@ def register_rental_routes(app, connect, require_actor, audit):
                     WHERE e.tenant_id=? AND e.management_contract_id IS NOT NULL
                       AND e.fund_category IN ('UNALLOCATED','UNIDENTIFIED','DEPOSIT','OWNER_RENT','OWNER_OTHER')
                     GROUP BY e.management_contract_id, 2
+                    UNION ALL
+                    SELECT NULL, 'unidentified', 0, COALESCE(SUM({signed_entry}),0)
+                    FROM fund_ledger_entries e
+                    WHERE e.tenant_id=? AND e.management_contract_id IS NULL AND e.fund_category='UNIDENTIFIED'
+                    UNION ALL
+                    SELECT NULL, 'company_funds', 0, COALESCE(SUM({signed_entry}),0)
+                    FROM fund_ledger_entries e JOIN fund_accounts f
+                      ON f.tenant_id=e.tenant_id AND f.id=e.fund_account_id AND f.account_code='COMPANY'
+                    WHERE e.tenant_id=? AND e.fund_category='COMPANY_FUNDS'
                 )
                 SELECT c.id AS management_contract_id, t.source,
                        SUM(t.business_amount) AS business_amount, SUM(t.ledger_amount) AS ledger_amount
                 FROM contract_ids c LEFT JOIN totals t ON t.contract_id=c.id
-                GROUP BY c.id,t.source ORDER BY c.id""",
-            (TENANT_ID,) * 6,
+                GROUP BY c.id,t.source
+                UNION ALL
+                SELECT NULL, source, SUM(business_amount), SUM(ledger_amount)
+                FROM totals WHERE contract_id IS NULL GROUP BY source
+                ORDER BY management_contract_id""",
+            (TENANT_ID,) * 9,
         ).fetchall()
         contracts = {}
+        independent = {}
         for row in rows:
-            contract = contracts.setdefault(row["management_contract_id"], {
+            contract_id = row["management_contract_id"]
+            checks = independent if contract_id is None else contracts.setdefault(contract_id, {
                 source: {"business_amount": 0, "ledger_amount": 0, "difference": 0}
                 for source in ("unallocated", "deposit", "owner_allocation")
             })
             if row["source"] is not None:
                 business, ledger = int(row["business_amount"]), int(row["ledger_amount"])
-                contract[row["source"]] = {"business_amount": business, "ledger_amount": ledger,
-                                           "difference": business - ledger}
-        return [dict(checks, management_contract_id=contract_id) for contract_id, checks in contracts.items()]
+                checks[row["source"]] = {"business_amount": business, "ledger_amount": ledger,
+                                         "difference": business - ledger}
+        contract_checks = [dict(checks, management_contract_id=contract_id) for contract_id, checks in contracts.items()]
+        return contract_checks, independent
 
     @router.get("/funds/summary", dependencies=[Depends(require_staff)])
     def funds_summary():
@@ -2328,7 +2360,7 @@ def register_rental_routes(app, connect, require_actor, audit):
                     GROUP BY f.id,f.account_code,f.account_name,f.status,e.fund_category ORDER BY f.id""",
                 (TENANT_ID,),
             ).fetchall()
-            reconciliation = reconcile_business_sources(db)
+            reconciliation, independent = reconcile_business_sources(db)
         accounts = {}
         for row in rows:
             account = accounts.setdefault(row["id"], {
@@ -2344,7 +2376,7 @@ def register_rental_routes(app, connect, require_actor, audit):
             categories.update({key: value for key, value in escrow["categories"].items() if key in categories})
         return {"accounts": list(accounts.values()), "escrow_categories": categories,
                 "reconciliation_difference": (escrow["balance"] if escrow else 0) - sum(categories.values()),
-                "business_reconciliation": reconciliation}
+                "business_reconciliation": reconciliation, "independent_reconciliation": independent}
 
     @router.get("/funds/ledger", dependencies=[Depends(require_staff)])
     def funds_ledger(fund_account_id: int = None, category: str = None, month: str = None,
