@@ -5,7 +5,7 @@ import random
 import re
 import uuid
 from calendar import monthrange
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
@@ -666,6 +666,7 @@ def register_rental_routes(app, connect, require_actor, audit):
         "proration_rule": ("ACTUAL_DAYS_FLOOR",),
         "screening_result": ("PENDING", "APPROVED", "REJECTED"),
     }
+    choices["cost_bearer"] = ("OWNER", "COMPANY", "TENANT")
     choices["payment_source"] = ("TENANT", "GUARANTOR_COMPANY", "OTHER")
     for field in ("external_signature_status", "external_procedure_status"):
         choices[field] = ("NOT_STARTED_SAMPLE", "IN_PROGRESS_SAMPLE", "RECORDED_SAMPLE")
@@ -684,9 +685,10 @@ def register_rental_routes(app, connect, require_actor, audit):
     columns = {
         table: {match[1]: (match[2], match[3], match[4], bool(match[5]))
                 for match in re.finditer(
-                    r"(\w+) (BIGINT|INT|TINYINT|DATE|VARCHAR|TEXT|DECIMAL|BOOLEAN|JSON)"
+                    r"(\w+) (BIGINT|INT|TINYINT|DATETIME|DATE|VARCHAR|TEXT|DECIMAL|BOOLEAN|JSON)"
                     r"(?:\((\d+)(?:,(\d+))?\))?( NOT NULL)?(?=,|\s*$)", TABLE_DEFINITIONS[table], re.M)}
-        for table in (*editable, "rent_charges", "payments", "payment_allocations")
+        for table in (*editable, "rent_charges", "payments", "payment_allocations",
+                      "work_orders", "complaints", "inspections")
     }
     columns["leases"]["cancellation_reason"] = columns["leases"]["termination_reason"]
     columns["reasons"] = {"reason": ("TEXT", None, None, True)}
@@ -700,6 +702,7 @@ def register_rental_routes(app, connect, require_actor, audit):
     amount_fields = {
         "advertised_rent", "advertised_common_fee", "minimum_fee", "proposed_rent",
         "proposed_common_fee", "rent_amount", "common_fee_amount", "deposit_amount", "key_money_amount",
+        "estimated_amount", "approved_amount", "actual_amount",
     }
     defaults = {
         "buildings": {"status": "ACTIVE"},
@@ -753,6 +756,17 @@ def register_rental_routes(app, connect, require_actor, audit):
                         value = date.fromisoformat(value)
                         valid = value.year >= 1000
                 except ValueError:
+                    valid = False
+            elif kind == "DATETIME":
+                try:
+                    valid = isinstance(value, str) and bool(re.fullmatch(
+                        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:\d{2})?", value,
+                    ))
+                    if valid:
+                        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                        value = value.replace(tzinfo=value.tzinfo or JST).astimezone(timezone.utc).replace(tzinfo=None)
+                        valid = value.year >= 1000
+                except (ValueError, OverflowError):
                     valid = False
             elif kind == "DECIMAL":
                 try:
@@ -2421,5 +2435,279 @@ def register_rental_routes(app, connect, require_actor, audit):
                 row.update(zip(keys, (opening, incoming, outgoing)))
                 row[prefix + "closing_balance"] = opening + incoming - outgoing
         return {"month": service_month, "basis": "CASH_FLOW", "items": rows}
+
+    case_location = "building_id unit_id"
+    case_fields = "category urgency description assigned_user_id"
+    inspection_fields = "inspection_type inspection_date inspected_by result findings next_inspection_date"
+    work_actions = {
+        "estimate": (("RECEIVED",), "ESTIMATED", "estimated_amount cost_bearer", ("estimated_amount",)),
+        "approve": (("ESTIMATED",), "APPROVED", "approved_amount approved_by", ("approved_amount",)),
+        "arrange": (("APPROVED",), "ARRANGED", "contractor_party_id scheduled_date",
+                    ("contractor_party_id", "scheduled_date")),
+        "complete": (("ARRANGED",), "COMPLETED", "completed_date actual_amount", ("completed_date", "actual_amount")),
+        "inspect": (("COMPLETED",), "INSPECTED", "inspected_by inspected_date", ("inspected_date",)),
+        "confirm-cost": (("INSPECTED",), "COST_CONFIRMED", "actual_amount", ("actual_amount",)),
+        "reapprove": (("COMPLETED", "INSPECTED"), None, "approved_amount approved_by", ("approved_amount",)),
+        "close": (("COST_CONFIRMED",), "CLOSED", "", ()),
+    }
+    complaint_actions = {
+        "start": ("OPEN", "IN_PROGRESS"),
+        "resolve": ("IN_PROGRESS", "RESOLVED"),
+        "close": ("RESOLVED", "CLOSED"),
+    }
+
+    def case_data(table, payload, allowed, required):
+        return money_values(table, payload, allowed, required=required.split())
+
+    def check_location(db, values):
+        if values.get("unit_id") is not None:
+            unit = get(db, "units", values["unit_id"], lock=True)
+            if unit["building_id"] != values["building_id"]:
+                invalid("指定した部屋はこの建物に属していません")
+
+    def linked_work_order(db, complaint_id):
+        return db.execute(
+            """SELECT id, work_order_code, status FROM work_orders
+               WHERE tenant_id=? AND complaint_id=? ORDER BY id LIMIT 1""",
+            (TENANT_ID, complaint_id),
+        ).fetchone()
+
+    def insert_case(db, actor, table, values):
+        row_id = insert(db, actor, table, values)
+        note = f"修繕 {values['work_order_id']} の検収" if values.get("work_order_id") else "登録"
+        audit(db, actor.user_id, f"rental.{table}.created", table, row_id, note)
+        return get(db, table, row_id)
+
+    def create_work_order_record(db, actor, values, complaint):
+        if complaint is not None:
+            if linked_work_order(db, complaint["id"]):
+                conflict("この苦情には既に修繕が登録されています")
+            if complaint["building_id"] != values["building_id"] or (
+                complaint["unit_id"] is not None and values.get("unit_id") not in (None, complaint["unit_id"])
+            ):
+                invalid("修繕の建物・部屋が苦情と一致しません")
+            if values.get("unit_id") is None:
+                values["unit_id"] = complaint["unit_id"]
+
+        check_location(db, values)
+        if values.get("unit_id") is not None:
+            received = values["received_date"]
+            management = management_for_period(db, values["unit_id"], received, received)
+            contract_id = management["id"] if management else None
+            if values.get("management_contract_id") not in (None, contract_id):
+                invalid("指定した管理契約は受付日にこの部屋を管理していません")
+            values["management_contract_id"] = contract_id
+        validate_refs(db, "work_orders", values)
+        return insert_case(db, actor, "work_orders", dict(
+            values, work_order_code=f"WO-{uuid.uuid4().hex}", status="RECEIVED",
+        ))
+
+    @router.post("/work-orders", status_code=201)
+    def create_work_order(payload: dict, actor=Depends(require_staff)):
+        values = case_data(
+            "work_orders", payload,
+            f"{case_location} {case_fields} received_date management_contract_id complaint_id cost_bearer",
+            f"building_id {case_fields} received_date",
+        )
+
+        def operation(db):
+            complaint_id = values.get("complaint_id")
+            complaint = get(db, "complaints", complaint_id, lock=True) if complaint_id else None
+            return create_work_order_record(db, actor, values, complaint)
+
+        return write(operation)
+
+    @router.post("/complaints", status_code=201)
+    def create_complaint(payload: dict, actor=Depends(require_staff)):
+        values = case_data(
+            "complaints", payload, f"{case_location} {case_fields} reporter_party_id received_at",
+            f"building_id {case_fields} received_at",
+        )
+
+        def operation(db):
+            validate_refs(db, "complaints", values)
+            check_location(db, values)
+            return insert_case(db, actor, "complaints", dict(
+                values, complaint_code=f"CMP-{uuid.uuid4().hex}", status="OPEN",
+            ))
+
+        return write(operation)
+
+    @router.post("/inspections", status_code=201)
+    def create_inspection(payload: dict, actor=Depends(require_staff)):
+        values = case_data(
+            "inspections", payload, f"{case_location} {inspection_fields}",
+            "building_id inspection_type inspection_date inspected_by result",
+        )
+        ordered_dates(values, "inspection_date", "next_inspection_date")
+
+        def operation(db):
+            validate_refs(db, "inspections", values)
+            check_location(db, values)
+            return insert_case(db, actor, "inspections", values)
+
+        return write(operation)
+
+    def change_case(db, actor, table, row, action, values, note=""):
+        update(db, actor, table, row, values)
+        target = values.get("status", row["status"])
+        audit(db, actor.user_id, f"rental.{table}.{action}", table, row["id"],
+              f"{row['status']} → {target}{note}")
+        return get(db, table, row["id"])
+
+    @router.post("/work-orders/{row_id}/{action}")
+    def transition_work_order(row_id: int, action: str, payload: dict, actor=Depends(require_staff)):
+        if action not in work_actions:
+            raise HTTPException(404, "指定された修繕操作が見つかりません")
+        sources, target, allowed, required = work_actions[action]
+
+        def operation(db):
+            row = get(db, "work_orders", row_id, lock=True)
+            data = dict(payload)
+            check_version(data, row)
+            if row["status"] not in sources:
+                invalid("現在の修繕状態ではこの操作はできません")
+            findings = None
+            if action == "inspect":
+                findings = fields("inspections", {"findings": data.pop("findings", None)}, ("findings",))["findings"]
+            values = money_values("work_orders", data, allowed, required=required)
+            if action == "estimate":
+                if not values.get("cost_bearer", row["cost_bearer"]):
+                    invalid("見積時に費用負担者を指定してください")
+            if action in {"approve", "reapprove"}:
+                values["approved_by"] = values.get("approved_by", actor.user_id)
+            if action == "inspect":
+                values["inspected_by"] = values.get("inspected_by", actor.user_id)
+            for key in ("approved_by", "inspected_by"):
+                if key in values and (type(values[key]) is not int or values[key] < 1):
+                    invalid(f"有効な担当者を指定してください（{key}）")
+            validate_refs(db, "work_orders", values)
+            note = ""
+            if action == "inspect":
+                inspection = insert_case(db, actor, "inspections", {
+                    "building_id": row["building_id"], "unit_id": row["unit_id"], "work_order_id": row_id,
+                    "inspection_type": "REPAIR_ACCEPTANCE", "inspection_date": values["inspected_date"],
+                    "inspected_by": values["inspected_by"], "result": "PASS", "findings": findings,
+                })
+                note = f" / 検収記録 {inspection['id']}"
+            if action == "confirm-cost":
+                if row["approved_amount"] is None or values["actual_amount"] > row["approved_amount"]:
+                    invalid("実費が承認額を超えています。先に再承認（reapprove）してください")
+                now = datetime.now(timezone.utc)
+                require_open_period(db, now.astimezone(JST).date())
+                values["cost_confirmed_at"] = now.replace(tzinfo=None)
+                note = f" / 確定実費 {values['actual_amount']} 円"
+            if "approved_amount" in values:
+                note = f" / 承認額 {values['approved_amount']} 円 / 承認者 {values['approved_by']}"
+            if target:
+                values["status"] = target
+            return change_case(db, actor, "work_orders", row, action, values, note)
+
+        return write(operation)
+
+    @router.post("/complaints/{row_id}/create-work-order", status_code=201)
+    def convert_complaint(row_id: int, payload: dict, actor=Depends(require_staff)):
+        def operation(db):
+            row = get(db, "complaints", row_id, lock=True)
+            data = dict(payload)
+            check_version(data, row)
+            if linked_work_order(db, row_id):
+                conflict("この苦情には既に修繕が登録されています")
+            if row["status"] not in {"OPEN", "IN_PROGRESS"}:
+                invalid("受付または対応中の苦情のみ修繕化できます")
+            values = case_data(
+                "work_orders", data, f"{case_fields} received_date management_contract_id cost_bearer", "",
+            )
+            for key in case_fields.split():
+                values.setdefault(key, row[key])
+            received = row["received_at"]
+            values.setdefault("received_date", received.replace(tzinfo=timezone.utc).astimezone(JST).date())
+            order = create_work_order_record(db, actor, dict(
+                values, building_id=row["building_id"], unit_id=row["unit_id"], complaint_id=row_id,
+            ), row)
+            change_case(db, actor, "complaints", row, "create-work-order",
+                        {"status": "IN_PROGRESS"}, f" / 修繕 {order['id']}")
+            return order
+
+        return write(operation)
+
+    @router.post("/complaints/{row_id}/{action}")
+    def transition_complaint(row_id: int, action: str, payload: dict, actor=Depends(require_staff)):
+        if action not in complaint_actions:
+            raise HTTPException(404, "指定された苦情操作が見つかりません")
+        source, target = complaint_actions[action]
+
+        def operation(db):
+            row = get(db, "complaints", row_id, lock=True)
+            data = dict(payload)
+            check_version(data, row)
+            if row["status"] != source:
+                invalid("現在の苦情状態ではこの操作はできません")
+            if action == "resolve":
+                summary = re.sub(r"^\\s+|\\s+$", "", data.get("resolution_summary", "")) if isinstance(
+                    data.get("resolution_summary"), str) else ""
+                values = case_data("complaints", dict(data, resolution_summary=summary),
+                                   "resolution_summary", "resolution_summary")
+                values["resolved_at"] = datetime.now(timezone.utc).replace(tzinfo=None)
+            else:
+                values = fields("complaints", data, ())
+            return change_case(db, actor, "complaints", row, action, dict(values, status=target))
+
+        return write(operation)
+
+    def case_rows(db, table, filters, args, limit, offset=0):
+        return db.execute(
+            f"""SELECT t.*, b.building_name, u.unit_number
+                FROM {table} t JOIN buildings b ON b.tenant_id=t.tenant_id AND b.id=t.building_id
+                LEFT JOIN units u ON u.tenant_id=t.tenant_id AND u.id=t.unit_id
+                WHERE t.tenant_id=? AND {' AND '.join(filters)} ORDER BY t.id DESC LIMIT ? OFFSET ?""",
+            (TENANT_ID, *args, limit, offset),
+        ).fetchall()
+
+    def register_case_reads(table):
+        path = "/" + table.replace("_", "-")
+        dependencies = [Depends(require_staff)]
+
+        @router.get(path, dependencies=dependencies, name=f"rental_{table}_list")
+        def listing(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0),
+                    status: str = None, urgency: str = None, building_id: int = None):
+            conditions = {"building_id": building_id}
+            if table != "inspections":
+                conditions.update(status=status, urgency=urgency)
+            filters, args = ["1=1"], []
+            for column, value in conditions.items():
+                if value is not None:
+                    filters.append(f"t.{column}=?")
+                    args.append(value)
+            with connect() as db:
+                return case_rows(db, table, filters, args, limit, offset)
+
+        @router.get(path + "/{row_id}", dependencies=dependencies, name=f"rental_{table}_detail")
+        def detail(row_id: int):
+            with connect() as db:
+                rows = case_rows(db, table, ["t.id=?"], (row_id,), 1)
+                if not rows:
+                    raise HTTPException(404, "指定されたデータが見つかりません")
+                row = rows[0]
+                if table == "work_orders":
+                    row["inspections"] = case_rows(db, "inspections", ["t.work_order_id=?"], (row_id,), 100)
+                    row["complaint"] = (
+                        get(db, "complaints", row["complaint_id"]) if row["complaint_id"] else None
+                    )
+                    row["settlement_eligible"] = (
+                        row["status"] in {"COST_CONFIRMED", "CLOSED"} and row["cost_bearer"] == "OWNER"
+                    )
+                    row["settlement_participated"] = db.execute(
+                        """SELECT 1 FROM settlement_lines
+                           WHERE tenant_id=? AND source_type IN ('work_order','WORK_ORDER') AND source_id=?
+                           LIMIT 1""",
+                        (TENANT_ID, row_id),
+                    ).fetchone() is not None
+                if table == "complaints":
+                    row["work_order"] = linked_work_order(db, row_id)
+                return row
+
+    for case_table in ("work_orders", "complaints", "inspections"):
+        register_case_reads(case_table)
 
     app.include_router(router)

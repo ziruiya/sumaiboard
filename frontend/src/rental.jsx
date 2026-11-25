@@ -82,6 +82,7 @@ export default function RentalPage({ page, apiBase }) {
       : page === "properties" ? <RentalProperties apiBase={apiBase}/>
         : page === "applications" ? <RentalPipeline apiBase={apiBase}/>
           : page === "rent" ? <RentalRent apiBase={apiBase}/>
+            : page === "repairs" ? <RentalRepairs apiBase={apiBase}/>
             : page === "funds" ? <RentalFunds apiBase={apiBase}/>
               : <p className="panel">準備中</p>}
   </section>;
@@ -103,6 +104,11 @@ const statuses = {
   RENT: "家賃", COMMON_FEE: "共益費", KEY_MONEY: "礼金", DEPOSIT: "敷金",
   RENEWAL: "更新料", RENEWAL_ADMIN: "更新事務手数料", BROKERAGE: "仲介手数料",
   MANAGEMENT: "管理料", REPAIR: "修繕費",
+  ESTIMATED: "見積済み", ARRANGED: "手配済み", COMPLETED: "作業完了", INSPECTED: "検収済み",
+  COST_CONFIRMED: "費用確定", CLOSED: "終了", OPEN: "受付", IN_PROGRESS: "対応中", RESOLVED: "解決済み",
+  URGENT: "緊急", HIGH: "高", NORMAL: "通常", LOW: "低", TENANT: "入居者",
+  EQUIPMENT: "設備", NOISE: "騒音", REPAIR_ACCEPTANCE: "修繕検収", ROUTINE: "通常点検",
+  PASS: "合格", FAIL: "要対応",
 };
 
 const unitStates = [["management_status", "管理状態"], ["occupancy_status", "入居状態"]];
@@ -249,10 +255,11 @@ function Pager({ offset, count, setOffset }) {
   </div>;
 }
 
-function ReferenceField({ apiBase, label, resource, value, setValue, optional }) {
+function ReferenceField({ apiBase, label, resource, value, setValue, optional, buildingId }) {
   const [offset, setOffset] = useState(0);
   const [selectedLabel, setSelectedLabel] = useState("");
-  const filter = resource === "fee-plans" ? "&status=ACTIVE" : "";
+  const filter = resource === "fee-plans" ? "&status=ACTIVE"
+    : resource === "units" && buildingId ? `&building_id=${buildingId}` : "";
   const result = useRentalData(apiBase, `${resource}?limit=${pageSize}&offset=${offset}${filter}`);
   const rows = result.data || [];
   return <div>
@@ -285,7 +292,7 @@ function ChargeSelection({ apiBase, value = [], setValue }) {
   </fieldset>}</RentalResult>;
 }
 
-function RentalField({ apiBase, field, value, setValue }) {
+function RentalField({ apiBase, field, value, setValue, buildingId }) {
   const [, label, kind] = field;
   if (Array.isArray(kind)) return <label>{label}<select required value={value ?? ""} onChange={(e) => setValue(e.target.value)}>
     <option value="">選択してください</option>
@@ -293,14 +300,14 @@ function RentalField({ apiBase, field, value, setValue }) {
     {kind.map((choice) => <option key={choice} value={choice}>{showValue(choice)}</option>)}
   </select></label>;
   if (kind?.startsWith("@")) return <ReferenceField apiBase={apiBase} label={label} resource={kind.slice(1).replace("?", "")}
-    optional={kind.endsWith("?")} value={value} setValue={setValue}/>;
+    optional={kind.endsWith("?")} value={value} setValue={setValue} buildingId={buildingId}/>;
   if (kind === "charges") return <ChargeSelection apiBase={apiBase} value={value} setValue={setValue}/>;
-  if (kind === "notes") return <label>{label}<textarea value={value ?? ""} onChange={(e) => setValue(e.target.value || null)}/></label>;
+  if (kind === "notes" || kind === "requiredNotes") return <label>{label}<textarea required={kind === "requiredNotes"} value={value ?? ""} onChange={(e) => setValue(e.target.value || null)}/></label>;
   if (kind === "boolean") return <label className="rental-check">
     <input type="checkbox" checked={Boolean(value)} onChange={(e) => setValue(e.target.checked)}/>{label}
   </label>;
   const integer = kind === "integer" || kind === "optionalInteger";
-  const type = integer ? "number" : kind === "date" || kind === "optionalDate" ? "date" : kind === "month" ? "month" : "text";
+  const type = integer ? "number" : kind === "date" || kind === "optionalDate" ? "date" : kind === "month" ? "month" : kind === "datetime" ? "datetime-local" : "text";
   const required = !kind?.startsWith("optional") && kind !== "month" && (kind !== "decimal" || field[0] !== "floor_area");
   return <label>{label}<input type={type} inputMode={kind === "decimal" ? "decimal" : undefined}
     required={required} value={kind === "month" ? value?.slice(0, 7) ?? "" : value ?? ""}
@@ -388,7 +395,7 @@ function RentalForm({ apiBase, resource, record, action, preset, onSaved, onCanc
         setFailure({ status: response.status, message: typeof data.detail === "string" ? data.detail : "入力内容を確認してください。" });
         return;
       }
-      onSaved(data, action?.[0] === "create-lease" ? "leases" : resource);
+      onSaved(data, action?.[0] === "create-lease" ? "leases" : action?.[0] === "create-work-order" ? "work-orders" : resource);
     } catch {
       setFailure({ message: "保存できませんでした。通信状況を確認してください。" });
     } finally {
@@ -402,8 +409,16 @@ function RentalForm({ apiBase, resource, record, action, preset, onSaved, onCanc
     {action?.[0] === "create-lease" && <RecordValues row={record} fields={[
       ["desired_move_in_date", "契約開始日"], ["proposed_rent", "家賃", "money"], ["proposed_common_fee", "共益費", "money"],
     ]}/>}
-    <div className="rental-fields">{fields.map((field) => <RentalField key={field[0]} apiBase={apiBase} field={field}
-      value={values[field[0]]} setValue={(value) => setValues((current) => ({ ...current, [field[0]]: value }))}/>)}</div>
+    <div className="rental-fields">{fields.map((field) => {
+      const [key] = field;
+      const caseUnit = key === "unit_id" && resource in caseResources;
+      if (caseUnit && !values.building_id) return null;
+      return <RentalField key={caseUnit ? `unit-${values.building_id}` : key} apiBase={apiBase} field={field}
+        buildingId={caseUnit ? values.building_id : undefined} value={values[key]}
+        setValue={(value) => setValues((current) => ({
+          ...current, ...(key === "building_id" && resource in caseResources ? { unit_id: null } : {}), [key]: value,
+        }))}/>;
+    })}</div>
     {editingAssignments && <>
       <PlanPreview apiBase={apiBase} planId={values.fee_plan_id} snapshot={record?.fee_plan_snapshot}/>
       <fieldset><legend>部屋の割当</legend>
@@ -1031,4 +1046,209 @@ function RentalFunds({ apiBase }) {
       </div>
     </div>;
   }}</RentalResult>;
+}
+
+const repairStates = ["RECEIVED", "ESTIMATED", "APPROVED", "ARRANGED", "COMPLETED", "INSPECTED", "COST_CONFIRMED", "CLOSED"];
+const complaintStates = ["OPEN", "IN_PROGRESS", "RESOLVED", "CLOSED"];
+const urgencies = ["URGENT", "HIGH", "NORMAL", "LOW"];
+const bearers = ["OWNER", "COMPANY", "TENANT"];
+const placeFields = [["building_id", "建物", "@buildings"], ["unit_id", "部屋", "@units?"]];
+const caseFields = [
+  ["category", "分類", ["EQUIPMENT", "NOISE", "OTHER"]], ["urgency", "緊急度", urgencies],
+  ["description", "内容", "requiredNotes"], ["assigned_user_id", "担当者", "@staff"],
+];
+const inspectionFields = [
+  ["inspection_type", "点検種別", ["ROUTINE", "OTHER"]], ["inspection_date", "点検日", "date"],
+  ["inspected_by", "点検者", "@staff"], ["result", "判定", ["PASS", "FAIL"]],
+  ["findings", "所見", "notes"], ["next_inspection_date", "次回点検日", "optionalDate"],
+];
+const caseResources = {
+  "work-orders": {
+    label: "修繕", name: (row) => row.work_order_code,
+    fields: [...placeFields, ["received_date", "受付日", "date"], ...caseFields],
+  },
+  complaints: {
+    label: "苦情", name: (row) => row.complaint_code,
+    fields: [...placeFields, ["reporter_party_id", "申出者", "@parties?"],
+      ["received_at", "受付日時（日本時間）", "datetime"], ...caseFields],
+  },
+  inspections: {
+    label: "点検", name: (row) => showValue(row.inspection_type),
+    fields: [...placeFields, ...inspectionFields],
+  },
+};
+Object.assign(resources, caseResources);
+
+const reapproveRepair = ["reapprove", "再承認", [["approved_amount", "再承認額（円）", "integer"]]];
+const repairActions = {
+  RECEIVED: [["estimate", "見積を記録", [["estimated_amount", "見積額（円）", "integer"], ["cost_bearer", "費用負担者", bearers]]]],
+  ESTIMATED: [["approve", "承認", [["approved_amount", "承認額（円）", "integer"]]]],
+  APPROVED: [["arrange", "手配", [["contractor_party_id", "協力会社", "@parties"], ["scheduled_date", "作業予定日", "date"]]]],
+  ARRANGED: [["complete", "作業完了", [["completed_date", "完了日", "date"], ["actual_amount", "暫定実費（円）", "integer"]]]],
+  COMPLETED: [["inspect", "検収", [["inspected_by", "検収者", "@staff"], ["inspected_date", "検収日", "date"], ["findings", "所見", "notes"]]], reapproveRepair],
+  INSPECTED: [["confirm-cost", "費用確定", [["actual_amount", "実費（円）", "integer"]]], reapproveRepair],
+  COST_CONFIRMED: [["close", "修繕を終了", []]],
+};
+const convertComplaint = ["create-work-order", "修繕化", []];
+const complaintActions = {
+  OPEN: [["start", "対応開始", []]],
+  IN_PROGRESS: [["resolve", "解決", [["resolution_summary", "対応結果", "requiredNotes"]]]],
+  RESOLVED: [["close", "苦情を終了", []]],
+};
+
+const formatJstTimestamp = new Intl.DateTimeFormat("ja-JP", {
+  timeZone: "Asia/Tokyo", dateStyle: "medium", timeStyle: "short",
+});
+function caseTimestamp(value) {
+  return value ? formatJstTimestamp.format(new Date(/(?:Z|[+-]\d{2}:\d{2})$/.test(value) ? value : value + "Z")) : null;
+}
+function casePlace(row) {
+  return [row.building_name, row.unit_number && `${row.unit_number}号室`].filter(Boolean).join(" ");
+}
+
+function CaseList({ apiBase, tab, open, create }) {
+  const [filters, setFilters] = useState({});
+  const [offset, setOffset] = useState(0);
+  const query = new URLSearchParams({ offset, ...filters });
+  const result = useRentalData(apiBase, `${tab}?${query}`);
+  const resource = caseResources[tab];
+  const states = tab === "work-orders" ? repairStates : complaintStates;
+
+  function filter(key, value) {
+    setFilters((current) => {
+      const next = { ...current };
+      if (value) next[key] = value;
+      else delete next[key];
+      return next;
+    });
+    setOffset(0);
+  }
+
+  return <>
+    <div className="panel rental-form">
+      <div className="rental-fields">
+        {tab !== "inspections" && [
+          ["urgency", "緊急度", urgencies], ["status", "状態", states],
+        ].map(([key, label, options]) => <label key={key}>{label}
+          <select value={filters[key] || ""} onChange={(event) => filter(key, event.target.value)}>
+            <option value="">すべて</option>
+            {options.map((option) => <option key={option} value={option}>{showValue(option)}</option>)}
+          </select>
+        </label>)}
+        <ReferenceField apiBase={apiBase} label="建物" resource="buildings" optional
+          value={filters.building_id} setValue={(value) => filter("building_id", value)}/>
+      </div>
+      <div className="rental-controls">
+        <button type="button" className="primary-btn" onClick={create}>{resource.label}を登録</button>
+      </div>
+    </div>
+    <RentalResult result={result}>{(rows) => <>
+      <MoneyList rows={rows} render={(row) => {
+        const urgent = tab === "work-orders" && row.urgency === "URGENT" &&
+          repairStates.indexOf(row.status) < repairStates.indexOf("COMPLETED");
+        const days = urgent ? Math.max(0, (Date.parse(todayJst()) - Date.parse(row.received_date)) / 86400000) : null;
+        return <button type="button" className="rental-list-button" onClick={() => open(tab, row.id)}>
+          <strong>{resource.name(row)}</strong>
+          <small>{[casePlace(row), row.description, row.inspection_date, row.urgency && showValue(row.urgency),
+            (row.status || row.result) && showValue(row.status || row.result)].filter(Boolean).join(" · ")}</small>
+          {urgent && <strong className="rental-error">緊急 · 受付から {days} 日</strong>}
+        </button>;
+      }}/>
+      <Pager offset={offset} count={rows.length} setOffset={setOffset}/>
+    </>}</RentalResult>
+  </>;
+}
+
+function CaseDetails({ apiBase, resource, id, back, open }) {
+  const result = useRentalData(apiBase, `${resource}/${id}`);
+  return <>
+    <div className="rental-controls">
+      <button type="button" className="secondary-btn" onClick={back}>戻る</button>
+    </div>
+    <RentalResult result={result}>{(row) => <CaseRecord key={`${id}:${row.version}`}
+      apiBase={apiBase} resource={resource} row={row} reload={result.retry} open={open}/>}</RentalResult>
+  </>;
+}
+
+function CaseRecord({ apiBase, resource, row, reload, open }) {
+  const [action, setAction] = useState(null);
+  const repair = resource === "work-orders";
+  const complaint = resource === "complaints";
+  const actions = repair ? repairActions[row.status] || [] : [...(complaintActions[row.status] || [])];
+  if (complaint && !row.work_order && ["OPEN", "IN_PROGRESS"].includes(row.status)) actions.push(convertComplaint);
+  if (action) return <RentalForm apiBase={apiBase} resource={resource} record={row} action={action}
+    onCancel={() => setAction(null)} onReload={reload}
+    onSaved={(saved, target) => {
+      if (target === resource) reload();
+      else open(target, saved.id);
+    }}/>;
+
+  const details = repair ? [
+    ["received_date", "受付日"], ["estimated_amount", "見積額", "money"], ["approved_amount", "承認額", "money"],
+    ["actual_amount", row.cost_confirmed_at ? "確定実費" : "暫定実費", "money"],
+    ["cost_bearer", "費用負担者"], ["settlement_eligibility", "精算参加可否"], ["settlement_state", "精算参加状況"],
+    ["cost_confirmed_at", "費用確定日時"], ["approved_by", "承認者 ID"], ["contractor_party_id", "協力会社 ID"],
+    ["scheduled_date", "作業予定日"], ["completed_date", "完了日"], ["inspected_date", "検収日"],
+    ["inspected_by", "検収者 ID"], ["management_contract_id", "管理契約 ID"],
+  ] : complaint ? [
+    ["received_at", "受付日時"], ["reporter_party_id", "申出者 ID"], ["resolved_at", "解決日時"],
+    ["resolution_summary", "対応結果"],
+  ] : inspectionFields.map(([key, label]) => [key, key === "inspected_by" ? "点検者 ID" : label]);
+
+  return <div className="panel rental-form">
+    <h2>{caseResources[resource].name(row)}</h2>
+    <RecordValues row={{
+      ...row, location: casePlace(row), received_at: caseTimestamp(row.received_at),
+      resolved_at: caseTimestamp(row.resolved_at), cost_confirmed_at: caseTimestamp(row.cost_confirmed_at),
+      settlement_eligibility: row.settlement_eligible ? "対象" : "対象外",
+      settlement_state: row.settlement_participated ? "参加済み" : "未精算",
+    }} fields={[
+      ["location", "建物・部屋"], ...(repair || complaint ? [
+        ["status", "状態"], ["urgency", "緊急度"], ["category", "分類"], ["description", "内容"],
+        ["assigned_user_id", "担当者 ID"],
+      ] : []), ...details,
+    ]}/>
+    <div className="rental-controls">
+      {actions.map((item) => <button type="button" key={item[0]} className="secondary-btn"
+        onClick={() => setAction(item)}>{item[1]}</button>)}
+      {row.complaint && <button type="button" className="secondary-btn" onClick={() => open("complaints", row.complaint.id)}>
+        苦情 {row.complaint.complaint_code}
+      </button>}
+      {(row.work_order || row.work_order_id) && <button type="button" className="secondary-btn"
+        onClick={() => open("work-orders", row.work_order?.id ?? row.work_order_id)}>
+        修繕 {row.work_order?.work_order_code ?? row.work_order_id}
+      </button>}
+    </div>
+    {repair && <div>
+      <h3>検収記録</h3>
+      <MoneyList rows={row.inspections} empty="検収記録はありません。" render={(inspection) =>
+        <MoneyRow title={showValue(inspection.inspection_type)}
+          description={`${inspection.inspection_date} · ${showValue(inspection.result)}`}
+          onClick={() => open("inspections", inspection.id)}/>}/>
+    </div>}
+  </div>;
+}
+
+function RentalRepairs({ apiBase }) {
+  const [tab, setTab] = useState("work-orders");
+  const [history, setHistory] = useState([]);
+  const view = history.at(-1);
+  const open = (resource, id) => setHistory((current) => [...current, { resource, id }]);
+  const back = () => setHistory((current) => current.slice(0, -1));
+  return <>
+    <div className="rental-controls">
+      {Object.entries(caseResources).map(([key, resource]) =>
+        <button type="button" key={key} className="secondary-btn" aria-pressed={tab === key} onClick={() => {
+          setTab(key);
+          setHistory([]);
+        }}>{resource.label}</button>)}
+    </div>
+    {view?.id ? <CaseDetails key={`${view.resource}:${view.id}`} apiBase={apiBase}
+      resource={view.resource} id={view.id} back={back} open={open}/>
+      : view ? <RentalForm apiBase={apiBase} resource={view.resource} onCancel={back}
+        preset={{ received_date: todayJst(), inspection_date: todayJst(), urgency: "NORMAL" }}
+        onSaved={(row, resource) => setHistory([{ resource, id: row.id }])}/>
+        : <CaseList key={tab} apiBase={apiBase} tab={tab} open={open}
+          create={() => setHistory([{ resource: tab }])}/>}
+  </>;
 }
