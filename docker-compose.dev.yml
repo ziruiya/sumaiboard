@@ -1,0 +1,49 @@
+# ローカル開発専用。本番では使用しないでください。
+name: enbai-dev
+
+services:
+  app:
+    build: .
+    container_name: enbai-dev-app
+    restart: "no"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:18083:8000"
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: enbai_dev
+      DB_USER: ${ENBAI_DEV_DB_USER:-enbai}
+      DB_PASSWORD: ${ENBAI_DEV_DB_PASSWORD:-devpassword}
+      DEMO_MODE: "true"
+      PUBLIC_SAMPLE_MODE: "true"
+      SAMPLE_RESET_TOKEN: ${ENBAI_DEV_SAMPLE_RESET_TOKEN:-dev-reset-token}
+      SAMPLE_GUEST_EMPLOYEE_CODE: EX-01
+      REFERRAL_STORAGE_DIR: /app/private_storage/referral-documents
+    volumes:
+      - enbai-dev-docs:/app/private_storage/referral-documents
+  mysql:
+    image: mysql:8.0
+    container_name: enbai-dev-mysql
+    restart: "no"
+    environment:
+      MYSQL_DATABASE: enbai_dev
+      MYSQL_USER: ${ENBAI_DEV_DB_USER:-enbai}
+      MYSQL_PASSWORD: ${ENBAI_DEV_DB_PASSWORD:-devpassword}
+      MYSQL_ROOT_PASSWORD: ${ENBAI_DEV_MYSQL_ROOT_PASSWORD:-devrootpassword}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    volumes:
+      - enbai-dev-mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+volumes:
+  enbai-dev-mysql:
+  enbai-dev-docs:
