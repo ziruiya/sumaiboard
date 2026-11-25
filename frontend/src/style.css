@@ -746,3 +746,39 @@
   }
   .expense-form input[type="file"] { max-width: 100%; }
 }
+
+/* Public sample watermark (rendered only in PUBLIC_SAMPLE_MODE): fixed tiled diagonal SAMPLE above page background, below menus/modals; never intercepts clicks */
+.sample-watermark{position:fixed;inset:0;z-index:1;pointer-events:none;background-repeat:repeat;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='560' height='380'><text x='280' y='190' font-family='Arial,Helvetica,sans-serif' font-size='84' font-weight='700' letter-spacing='8' fill='%234a5568' fill-opacity='0.13' text-anchor='middle' dominant-baseline='middle' transform='rotate(-26 280 190)'>SAMPLE</text></svg>")}
+
+.rental-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 1.5rem;
+}
+
+.rental-nav [aria-current="page"] {
+  border-color: currentColor;
+  font-weight: 700;
+}
+
+.rental-page {
+  min-width: 0;
+}
+
+.rental-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 11rem), 1fr));
+  gap: 0.75rem;
+}
+
+.rental-metric {
+  display: grid;
+  align-content: start;
+  gap: 0.35rem;
+  padding: 1rem;
+}
+
+.rental-metric strong {
+  font-size: 1.55rem;
+}

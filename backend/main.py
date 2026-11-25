@@ -25,6 +25,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from backend.pdf_export import PDF_TEMPLATE_VERSION, build_pdf_isolated
+from backend import rental
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -394,6 +395,7 @@ CREATE TABLE IF NOT EXISTS sla_settings (
 """
 
 TABLES = [
+    *rental.RENTAL_RESET_TABLES,
     "user_preferences", "bulletin_comments", "bulletin_posts", "calendar_events",
     "audit_logs", "daily_report_drafts", "export_jobs", "import_row_results",
     "import_jobs", "external_record_mappings", "month_closes", "month_close_period_locks", "expenses",
@@ -418,7 +420,7 @@ SESSION_COOKIE = "mallboard_session"
 LEGACY_ROLE_ALIASES = ("advisor", "manager", "hq_finance", "executive", "hr")
 ACCOUNT_ROLES = {
     "executive": "executive", "administrator": "executive", "hq_staff": "hq_finance",
-    "store_manager": "manager", "advisor": "advisor", "finance": "hq_finance", "hr": "hr",
+    "store_manager": "manager", "advisor": "advisor", "finance": "hq_finance", "hr": "hr", "owner": "owner",
 }
 
 SYSTEM_CONFIG_DEFAULTS = {
@@ -561,6 +563,159 @@ def demo_mode_enabled():
     return os.getenv("DEMO_MODE", "false").strip().lower() == "true"
 
 
+def public_sample_mode_enabled():
+    return os.getenv("PUBLIC_SAMPLE_MODE", "false").strip().lower() == "true"
+
+
+SAMPLE_GUEST_EMPLOYEE_CODE = os.getenv("SAMPLE_GUEST_EMPLOYEE_CODE", "EX-01")
+SAMPLE_BLOCK_MESSAGE = "公開サンプルではこの操作はできません（表示データはすべて架空で、毎日自動リセットされます）"
+
+_SAMPLE_BLOCKED = [
+    ({"POST", "PUT", "PATCH", "DELETE"}, r"^/api/bulletin(/.*)?$"),
+    ({"POST"}, r"^/api/expenses$"),
+    ({"PUT"}, r"^/api/expenses/\d+$"),
+    ({"POST"}, r"^/api/expenses/\d+/receipt$"),
+    ({"POST"}, r"^/api/households/\d+/disclosures$"),
+    ({"POST"}, r"^/api/households/\d+/data-corrections$"),
+    ({"POST"}, r"^/api/data-corrections/[^/]+/decision$"),
+    ({"POST"}, r"^/api/introductions/\d+/dispute$"),
+    ({"POST"}, r"^/api/referral-disputes/[^/]+/decision$"),
+    ({"POST"}, r"^/api/introductions/\d+/referral-documents$"),
+    ({"POST"}, r"^/api/referral-documents/cleanup$"),
+    ({"POST"}, r"^/api/consents/[^/]+/revoke$"),
+    ({"POST"}, r"^/api/month-closes(/.*)?$"),
+    ({"PUT"}, r"^/api/system-config/[^/]+$"),
+    ({"PUT"}, r"^/api/accounts/\d+/(status|role)$"),
+    ({"POST"}, r"^/api/export-jobs$"),
+    ({"POST"}, r"^/api/imports(/.*)?$"),
+    ({"POST"}, r"^/api/auth/change-password$"),
+    ({"POST"}, r"^/api/auth/password-reset-requests$"),
+    ({"POST"}, r"^/api/auth/password-reset$"),
+    ({"POST"}, r"^/api/reset$"),
+]
+
+_SAMPLE_NEUTRALIZE = [
+    ("POST", r"^/api/activities$", {"body": "サンプル活動メモ",
+                                    "next_action": lambda v: "フォローアップ" if v else v}),
+    ("POST", r"^/api/calendar$", {"title": "サンプル予定"}),
+    ("PUT", r"^/api/calendar/\d+$", {"title": "サンプル予定"}),
+    ("POST", r"^/api/introductions/\d+/referral-consent$", {"evidence_reference": "サンプル確認済"}),
+    ("PUT", r"^/api/report$", {"manual_note": ""}),
+    ("POST", r"^/api/expenses/\d+/(approve|reject)$", {"reason": None}),
+]
+
+
+class SampleGuardMiddleware:
+    """Public-sample guard, active only when PUBLIC_SAMPLE_MODE=true.
+
+    Blocks write endpoints whose payload is free text or whose effect is
+    administrative/destructive (bulletin posts and comments, expense
+    creation, disputes, data corrections, month-close, system config,
+    account management, imports, export jobs, password operations and the
+    demo reset). On a small set of structured demo flows it replaces
+    free-text fields with canned sample values, so visitors can add and
+    modify records with selects, numbers and dates only. The scheduled
+    on-box reset job is exempted for POST /api/reset when it presents the
+    SAMPLE_RESET_TOKEN header; the token lives only in the server .env.
+    """
+
+    def __init__(self, app):
+        self.app = app
+        self.resetting = False
+        self.active_requests = 0
+        self.idle = asyncio.Event()
+        self.idle.set()
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not public_sample_mode_enabled():
+            await self.app(scope, receive, send)
+            return
+        method = scope.get("method", "")
+        path = scope.get("path", "")
+        if path.startswith(rental.LEGACY_SAMPLE_PREFIXES):
+            await JSONResponse({"detail": SAMPLE_BLOCK_MESSAGE}, status_code=410)(scope, receive, send)
+            return
+        if not path.startswith("/api/"):
+            await self.app(scope, receive, send)
+            return
+        if self.resetting:
+            await JSONResponse({"detail": "サンプルデータをリセット中です"}, status_code=409)(scope, receive, send)
+            return
+        if path.rstrip("/") == "/api/reset" and method == "POST":
+            headers = {k.lower(): v for k, v in scope.get("headers") or []}
+            presented = headers.get(b"x-sample-reset-token", b"").decode("utf-8", "ignore")
+            expected = os.getenv("SAMPLE_RESET_TOKEN", "")
+            if presented and expected and hmac.compare_digest(presented, expected):
+                self.resetting = True
+                try:
+                    await self.idle.wait()
+                    await self.app(scope, receive, send)
+                finally:
+                    self.resetting = False
+                return
+            await JSONResponse({"detail": SAMPLE_BLOCK_MESSAGE}, status_code=422)(scope, receive, send)
+            return
+        self.active_requests += 1
+        self.idle.clear()
+        try:
+            await self.guard_request(scope, receive, send, method, path)
+        finally:
+            self.active_requests -= 1
+            if not self.active_requests:
+                self.idle.set()
+
+    async def guard_request(self, scope, receive, send, method, path):
+        if method not in ("POST", "PUT", "PATCH", "DELETE"):
+            await self.app(scope, receive, send)
+            return
+        for methods, pattern in _SAMPLE_BLOCKED:
+            if method in methods and re.match(pattern, path):
+                response = JSONResponse({"detail": SAMPLE_BLOCK_MESSAGE}, status_code=422)
+                await response(scope, receive, send)
+                return
+        for rule_method, pattern, fields in _SAMPLE_NEUTRALIZE:
+            if method == rule_method and re.match(pattern, path):
+                body = b""
+                while True:
+                    message = await receive()
+                    if message["type"] == "http.request":
+                        body += message.get("body", b"")
+                        if not message.get("more_body"):
+                            break
+                    elif message["type"] == "http.disconnect":
+                        break
+                try:
+                    payload = json.loads(body or b"{}")
+                except (ValueError, TypeError):
+                    payload = None
+                if isinstance(payload, dict):
+                    for field, replacement in fields.items():
+                        if field in payload:
+                            payload[field] = (replacement(payload[field])
+                                              if callable(replacement) else replacement)
+                    body = json.dumps(payload).encode("utf-8")
+                headers = [(k, v) for k, v in scope.get("headers") or []
+                           if k.lower() != b"content-length"]
+                headers.append((b"content-length", str(len(body)).encode("ascii")))
+                scope = dict(scope)
+                scope["headers"] = headers
+                replayed = False
+
+                async def replay_receive():
+                    nonlocal replayed
+                    if not replayed:
+                        replayed = True
+                        return {"type": "http.request", "body": body, "more_body": False}
+                    return await receive()
+
+                await self.app(scope, replay_receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(SampleGuardMiddleware)
+
+
 def hash_secret(secret):
     salt = secrets.token_bytes(16)
     derived = hashlib.scrypt(secret.encode("utf-8"), salt=salt, n=2**14, r=8, p=1, dklen=32)
@@ -687,6 +842,10 @@ async def require_actor(request: Request):
             db.execute("UPDATE auth_sessions SET revoked_at=? WHERE id=?", (now, row["session_id"]))
             db.commit()
             raise HTTPException(401, "認証が必要です")
+        if row["role"] == "owner" and request.url.path not in (
+                "/api/bootstrap", "/api/auth/logout", "/api/notifications"):
+            if not request.url.path.startswith("/api/rental/"):
+                raise HTTPException(403, "オーナーアカウントからこの操作はできません")
         if row["must_change_password"] and request.url.path not in (
                 "/api/bootstrap", "/api/auth/change-password", "/api/auth/logout"):
             raise HTTPException(403, "初回ログイン時にパスワードを変更してください")
@@ -1127,6 +1286,38 @@ def demo_login(payload: DemoLoginInput, request: Request, response: Response):
         session_hours = config_value(db, "auth.session_absolute_timeout_hours")
     set_session_cookie(request, response, token, session_hours)
     return {"ok": True, "account": account}
+
+
+@app.get("/api/public-config")
+def public_config():
+    return {"demo": demo_mode_enabled(), "public_sample": public_sample_mode_enabled()}
+
+
+@app.post("/api/auth/guest-login")
+def guest_login(request: Request, response: Response):
+    if not public_sample_mode_enabled():
+        raise HTTPException(403, "公開サンプルモードは無効です")
+    with connect() as db:
+        user = db.execute(
+            "SELECT id,role,store_id,account_status FROM users WHERE employee_code=?",
+            (SAMPLE_GUEST_EMPLOYEE_CODE,),
+        ).fetchone()
+        if not user or user["account_status"] != "ACTIVE":
+            raise HTTPException(503, "サンプルアカウントが利用できません")
+        previous = request.cookies.get(SESSION_COOKIE)
+        if previous:
+            db.execute("UPDATE auth_sessions SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL",
+                       (now_jst(), token_digest(previous)))
+        db.execute("UPDATE users SET last_login_at=? WHERE id=?", (now_jst(), user["id"]))
+        token = create_session(db, user["id"], request)
+        audit(db, user["id"], "SAMPLE_GUEST_LOGIN", "user", user["id"],
+              json.dumps({"source_ip": request.client.host if request.client else None,
+                          "user_agent": request.headers.get("user-agent", "")[:200]}))
+        db.commit()
+        account = {"id": user["id"], "role": user["role"], "store_id": user["store_id"]}
+        session_hours = config_value(db, "auth.session_absolute_timeout_hours")
+    set_session_cookie(request, response, token, session_hours)
+    return {"ok": True, "account": account, "guest": True}
 
 
 @app.post("/api/auth/login")
@@ -1710,7 +1901,7 @@ def ensure_demo_accounts(db):
         f"UPDATE users SET must_change_password=0 WHERE employee_code IN ({placeholders})",
         demo_employee_codes,
     )
-    count = db.execute("SELECT COUNT(*) AS count FROM users").fetchone()["count"]
+    count = db.execute("SELECT COUNT(*) AS count FROM users WHERE role <> 'owner'").fetchone()["count"]
     if count != 46:
         raise RuntimeError(f"Expected 46 demo accounts; found {count}")
 def valid_config_value(key, value):
@@ -1792,6 +1983,14 @@ def demo_receipt_pdf():
 
 
 def seed(db):
+    _seed_legacy(db)
+    ensure_system_config(db)
+    ensure_demo_accounts(db)
+    rental.ensure_rental_schema(db)
+    rental.seed_rental(db)
+
+
+def _seed_legacy(db):
     ensure_schema(db)
     if db.execute("SELECT COUNT(*) FROM seed_metadata WHERE id=1").fetchone()[0]:
         return
@@ -2346,8 +2545,6 @@ for attempt in range(60):
     try:
         with connect() as db:
             seed(db)
-            ensure_system_config(db)
-            ensure_demo_accounts(db)
         break
     except pymysql.MySQLError:
         if attempt == 59:
@@ -2453,7 +2650,7 @@ def bootstrap(x_demo_role: CurrentActor = Depends(require_actor)):
             {"id": "executive", "name": "社長"}, {"id": "administrator", "name": "管理者"},
             {"id": "hq_staff", "name": "本社担当"}, {"id": "store_manager", "name": "店長"},
             {"id": "advisor", "name": "顧問"}, {"id": "finance", "name": "財務"},
-            {"id": "hr", "name": "人事"},
+            {"id": "hr", "name": "人事"}, {"id": "owner", "name": "オーナー"},
         ]
         return {
             "user": {"id": user["id"], "public_id": user["public_id"],
@@ -2467,12 +2664,16 @@ def bootstrap(x_demo_role: CurrentActor = Depends(require_actor)):
                 "hq_finance": ["fees.read", "fees.approve", "invoice_data.manage"],
                 "executive": ["dashboard.all", "management.all", "construction.confirm"],
                 "hr": ["accounts.read", "accounts.manage"],
+                "owner": [],
             }.get(role, ["accounts.read", "accounts.manage"] if user["role"] in
                   ("administrator", "hr") else ["dashboard.all", "management.all"]),
-            "menus": ["accounts"] if user["role"] == "hr" else
-                     ["dashboard", "households", "introductions", "revenue", "management", "settings"],
+            "menus": {"hr": ["accounts"], "owner": ["owner-portal"]}.get(user["role"], [
+                "dashboard", "properties", "applications", "rent", "repairs", "settlements",
+                "funds", "owner-portal", "team", "management", "settings",
+            ]),
             "enums": {"stages": STAGES, "roles": [item["id"] for item in roles]},
-            "environment": {"demo": demo_mode_enabled()},
+            "environment": {"demo": demo_mode_enabled(),
+                            "public_sample": public_sample_mode_enabled()},
         }
 
 
@@ -4751,8 +4952,11 @@ def reset_demo(request: Request, x_demo_role: CurrentActor = Depends(require_act
     role_guard(x_demo_role, ("hq_finance",))
     referral_storage_keys = []
     with connect() as db:
+        rental.check_rental_reset_scope(db)
         session_token = request.cookies.get(SESSION_COOKIE)
-        if session_token:
+        if public_sample_mode_enabled():
+            db.execute("DELETE FROM auth_sessions")
+        elif session_token:
             db.execute("DELETE FROM auth_sessions WHERE token_hash<>?", (token_digest(session_token),))
         db.execute("DELETE FROM password_reset_tokens")
         db.execute("DELETE FROM auth_login_attempts")
@@ -4768,8 +4972,6 @@ def reset_demo(request: Request, x_demo_role: CurrentActor = Depends(require_act
         for table in TABLES:
             db.execute(f"DROP TABLE IF EXISTS `{table}`")
         seed(db)
-        ensure_system_config(db)
-        ensure_demo_accounts(db)
     for storage_key in referral_storage_keys:
         if Path(storage_key).name == storage_key:
             (REFERRAL_STORAGE_DIR / storage_key).unlink(missing_ok=True)
@@ -6055,6 +6257,8 @@ def health():
         db.execute("SELECT 1")
     return {"status": "ok"}
 
+
+rental.register_rental_routes(app, connect, require_actor)
 
 DIST = ROOT / "frontend" / "dist"
 if DIST.exists():

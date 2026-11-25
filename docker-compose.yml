@@ -25,6 +25,9 @@ services:
       DB_USER: ${DB_USER:?Set DB_USER in .env}
       DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
       DEMO_MODE: ${DEMO_MODE:-false}
+      PUBLIC_SAMPLE_MODE: ${PUBLIC_SAMPLE_MODE:-false}
+      SAMPLE_RESET_TOKEN: ${SAMPLE_RESET_TOKEN:-}
+      SAMPLE_GUEST_EMPLOYEE_CODE: ${SAMPLE_GUEST_EMPLOYEE_CODE:-EX-01}
       REFERRAL_STORAGE_DIR: /app/private_storage/referral-documents
     volumes:
       - referral-documents:/app/private_storage/referral-documents

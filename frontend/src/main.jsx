@@ -3,11 +3,12 @@ import { createRoot } from "react-dom/client";
 import {
   Activity, ArrowDownRight, ArrowUpRight, BadgeJapaneseYen, Bell, Building2, CalendarDays,
   Check, ChevronDown, ChevronRight, ChevronUp, CircleAlert, ClipboardList, Clock3, FileText, Filter,
-  Home, Languages, LayoutDashboard, LogOut, Menu, Plus, Search, Settings, ShieldCheck,
+  Home, Languages, LogOut, Menu, Plus, Search, Settings, ShieldCheck,
   Users, WalletCards, X,
 } from "lucide-react";
 import "./style.css";
 import CollaborationWorkspace from "./collaboration.jsx";
+import RentalPage, { rentalPages } from "./rental.jsx";
 import { todayJst } from "./jst-date.js";
 
 const COPY = {
@@ -687,6 +688,7 @@ const ACCOUNT_STATUS = {
 };
 
 function roleLabel(locale, role) {
+  if (role === "owner") return locale === "zh" ? "业主" : "オーナー";
   const labels = ROLE_LABEL[locale];
   return labels && Object.hasOwn(labels, role) ? labels[role] : role;
 }
@@ -735,12 +737,6 @@ function CustomerDisputeBadge({ t }) {
   return <span className="pill customer-dispute-badge">{t("customerDispute")}</span>;
 }
 
-const NAV = [
-  ["dashboard", LayoutDashboard, "today"], ["households", Users, "households"],
-  ["introductions", ArrowDownRight, "introductions"], ["revenue", BadgeJapaneseYen, "revenue"],
-  ["team", CalendarDays, "collaboration"],
-  ["management", Building2, "management"], ["settings", Settings, "settings"],
-];
 const STAGES = ["新規予約", "初回相談済", "FP診断済", "紹介済", "訪問・商談中", "契約", "着工", "完了・見送り"];
 const TERMINAL_STAGES = ["完了・見送り", "完了", "見送り"];
 function matchBusinessTasks(businessFilter, tasks) {
@@ -781,12 +777,12 @@ function App() {
   const [authenticated, setAuthenticated] = useState(false);
   const [demoAccounts, setDemoAccounts] = useState([]);
   const [demoAvailable, setDemoAvailable] = useState(false);
+  const [sampleMode, setSampleMode] = useState(false);
   const [loginError, setLoginError] = useState("");
   const [notifications, setNotifications] = useState([]);
   const [notificationUnreadCount, setNotificationUnreadCount] = useState(0);
   const [notificationCenterOpen, setNotificationCenterOpen] = useState(false);
   const notificationRequestId = useRef(0);
-  const [summary, setSummary] = useState(null);
   const [tasks, setTasks] = useState([]);
   const [preferences, setPreferences] = useState({ dashboard_widgets: ["tasks", "overview"], notification_preferences: { in_app: true, email: false } });
   const [businessFilter, setBusinessFilter] = useState("");
@@ -827,10 +823,10 @@ function App() {
     if (!identityResponse.ok) throw new Error("session expired");
     const identity = await identityResponse.json();
     setRole(identity.role);
+    setSampleMode(Boolean(identity.environment?.public_sample));
     if (identity.user.must_change_password) {
       notificationRequestId.current += 1;
       setData(identity);
-      setSummary({ counters: [] });
       setTasks([]);
       setNotifications([]);
       setNotificationUnreadCount(0);
@@ -838,38 +834,20 @@ function App() {
       setAuthenticated(true);
       return identity;
     }
-    let result;
-    if (identity.account_role === "hr") {
+    const result = { ...identity, households: [] };
+    if (["hr", "administrator"].includes(identity.account_role)) {
       const accountsResponse = await fetch(`${API_BASE}/api/accounts`, { credentials: "include" });
       if (!accountsResponse.ok) throw new Error("account access denied");
-      result = { ...identity, ...(await accountsResponse.json()) };
-      setPage("accounts");
-      setSummary({ counters: [] });
-      setTasks([]);
-    } else {
-      const [domainResponse, summaryResponse, tasksResponse, preferencesResponse] = await Promise.all([
-        fetch(`${API_BASE}/api/households`, { credentials: "include" }),
-        fetch(`${API_BASE}/api/dashboard/summary`, { credentials: "include" }),
-        fetch(`${API_BASE}/api/dashboard/my-tasks`, { credentials: "include" }),
-        fetch(`${API_BASE}/api/preferences`, { credentials: "include" }),
-      ]);
-      if ([domainResponse, summaryResponse, tasksResponse, preferencesResponse].some((response) => !response.ok)) {
-        throw new Error("business data access denied");
-      }
-      const [domain, nextSummary, nextTasks, nextPreferences] = await Promise.all([
-        domainResponse.json(), summaryResponse.json(), tasksResponse.json(), preferencesResponse.json(),
-      ]);
-      result = { ...identity, ...domain,
-        construction_confirmation_backlog: nextSummary.construction_confirmation_backlog };
-      if (identity.account_role === "administrator") {
-        const accountsResponse = await fetch(`${API_BASE}/api/accounts`, { credentials: "include" });
-        if (!accountsResponse.ok) throw new Error("account access denied");
-        Object.assign(result, await accountsResponse.json());
-      }
-      setSummary(nextSummary);
-      setTasks(nextTasks.items);
-      setPreferences(nextPreferences);
+      Object.assign(result, await accountsResponse.json());
     }
+    if (identity.account_role === "hr") setPage("accounts");
+    else if (identity.account_role === "owner") setPage("owner-portal");
+    else {
+      const preferencesResponse = await fetch(`${API_BASE}/api/preferences`, { credentials: "include" });
+      if (!preferencesResponse.ok) throw new Error("preferences access denied");
+      setPreferences(await preferencesResponse.json());
+    }
+    setTasks([]);
     setData(result);
     setAuthenticated(true);
     if (selected) setSelected(result.households?.find((h) => h.id === selected.id) || null);
@@ -884,7 +862,28 @@ function App() {
     if (window.matchMedia("(max-width: 1023px)").matches) window.scrollTo(0, 0);
   }, [page, workspaceView]);
   useEffect(() => {
-    load().catch(() => {});
+    fetch(`${API_BASE}/api/public-config`)
+      .then(async (response) => (response.ok ? response.json() : null))
+      .then((config) => { if (config?.public_sample) setSampleMode(true); })
+      .catch(() => {});
+  }, []);
+  useEffect(() => {
+    (async () => {
+      try {
+        await load();
+      } catch {
+        try {
+          const configResponse = await fetch(`${API_BASE}/api/public-config`);
+          const config = configResponse.ok ? await configResponse.json() : null;
+          if (config?.public_sample) {
+            const guestResponse = await fetch(`${API_BASE}/api/auth/guest-login`, {
+              method: "POST", credentials: "include",
+            });
+            if (guestResponse.ok) await load();
+          }
+        } catch { /* stay on the login page */ }
+      }
+    })();
     fetch(`${API_BASE}/api/auth/demo-accounts`, { credentials: "include" })
       .then(async (response) => {
         if (!response.ok) return;
@@ -958,6 +957,27 @@ function App() {
     const id = setTimeout(() => setToast(""), 3000);
     return () => clearTimeout(id);
   }, [toast]);
+  useEffect(() => {
+    if (!sampleMode || !authenticated) return undefined;
+    const lockTextInputs = () => {
+      document.querySelectorAll("input, textarea").forEach((el) => {
+        if (el.closest(".searchbox") || el.closest(".login-card")) return;
+        const type = (el.getAttribute("type") || "text").toLowerCase();
+        if (type === "file") { el.disabled = true; return; }
+        if (el.tagName === "TEXTAREA" || ["text", "search", "tel", "email", "url", "password"].includes(type)) {
+          el.readOnly = true;
+          el.setAttribute("data-sample-locked", "1");
+        }
+      });
+      document.querySelectorAll('[contenteditable="true"]').forEach((el) => {
+        el.setAttribute("contenteditable", "false");
+      });
+    };
+    lockTextInputs();
+    const observer = new MutationObserver(lockTextInputs);
+    observer.observe(document.body, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, [sampleMode, authenticated, page, modal, data]);
 
   async function api(path, method = "POST", body) {
     setBusy(true);
@@ -994,7 +1014,9 @@ function App() {
       if (!response.ok) throw new Error(payload.detail || t("error"));
       const identity = await load();
       setBusinessFilter("");
-      if (!identity.user.must_change_password && identity.account_role !== "hr") setPage("dashboard");
+      if (!identity.user.must_change_password && identity.account_role !== "hr") {
+        setPage(identity.account_role === "owner" ? "owner-portal" : "dashboard");
+      }
     } catch (error) {
       setLoginError(error.message || t("error"));
     } finally { setBusy(false); }
@@ -1007,7 +1029,6 @@ function App() {
     await fetch(`${API_BASE}/api/auth/logout`, { method: "POST", credentials: "include" });
     setAuthenticated(false);
     setData(null);
-    setSummary(null);
     setTasks([]);
     setNotifications([]);
     setNotificationUnreadCount(0);
@@ -1034,22 +1055,7 @@ function App() {
   }
   function openNotification(notification) {
     setNotificationCenterOpen(false);
-    if (notification.related_record_type === "household") {
-      const household = data.households?.find((item) => String(item.id) === notification.related_record_id);
-      if (household) openHousehold(household);
-      else setPage("households");
-    } else if (notification.related_record_type === "introduction") {
-      setBusinessFilter("disputed");
-      setPage("introductions");
-    } else if (notification.related_record_type === "construction_project"
-        || notification.related_record_type === "fee_entitlement") {
-      setBusinessFilter(notification.related_record_type === "construction_project"
-        ? "construction:pending" : "state:Pending");
-      setPage("revenue");
-    } else if (notification.related_record_type === "task") {
-      setBusinessFilter("tasks:overdue");
-      setPage("households");
-    } else if (notification.related_record_type === "audit_outbox") {
+    if (notification.related_record_type === "audit_outbox" && data.account_role !== "owner") {
       setPage("settings");
     }
   }
@@ -1144,15 +1150,23 @@ function App() {
     const household = data.households.find((h) => h.introductions.some((intro) => intro.id === item.id));
     if (household) setIntroFocusHouseholdId(household.id);
   }
-  if (!authenticated || !data) return <LoginPage locale={locale} setLocale={setLocale} t={t} accounts={demoAccounts}
-    demoAvailable={demoAvailable} error={loginError} busy={busy} onLogin={login}/>;
-  const navItems = data.account_role === "hr" ? [["accounts", Users, "accounts"]]
-    : data.account_role === "administrator" ? [...NAV, ["accounts", Users, "accounts"]] : NAV;
+  if (!authenticated || !data) return <>{sampleMode && <SampleWatermark />}<LoginPage locale={locale} setLocale={setLocale} t={t} accounts={demoAccounts}
+    demoAvailable={demoAvailable} error={loginError} busy={busy} onLogin={login}/></>;
+  const navItems = data.account_role === "owner" ? rentalPages.slice(-1)
+    : data.account_role === "hr" ? [["accounts", t("accounts")]]
+      : [...rentalPages, ["team", t("collaboration")], ["management", t("management")],
+        ["settings", t("settings")],
+        ...(data.account_role === "administrator" ? [["accounts", t("accounts")]] : [])];
+  const homePage = navItems[0][0];
 
   return <div className="app-shell">
-    <header className="app-bar"><button className="app-brand" onClick={() => { setWorkspaceView("home"); setPage(data.account_role === "hr" ? "accounts" : "dashboard"); }}><span className="brand-mark"><Home size={20}/></span><span><b>SumaiBoard</b><small>{t("subtitle")}</small></span></button>
+    {sampleMode && <div style={{ background: "#7c2d12", color: "#fff", padding: "6px 14px", fontSize: "12.5px", textAlign: "center" }}>
+      共有サンプル環境：表示データはすべて架空です。ログイン不要で操作を試せますが、文字入力は無効化され、データは毎日自動リセットされます。
+    </div>}
+    {sampleMode && <SampleWatermark />}
+    <header className="app-bar"><button className="app-brand" onClick={() => { setWorkspaceView("home"); setPage(homePage); }}><span className="brand-mark"><Home size={20}/></span><span><b>SumaiBoard</b><small>賃貸管理業務</small></span></button>
       <div className="top-actions">
-        {data.account_role !== "hr" && (!searchExpanded
+        {["households", "introductions", "revenue"].includes(page) && (!searchExpanded
           ? <button type="button" className="search-launch" ref={searchLaunchRef} aria-expanded={false}
               onClick={() => setSearchExpanded(true)}><Search size={16}/>{t("search")}</button>
           : <div className="search-control" ref={searchControlRef}
@@ -1218,28 +1232,36 @@ function App() {
                 </>}
               </div>}
             </div>)}
-        <div className="notification-anchor"><button type="button" className="icon-btn" title={t("notifications")}
+        {data.account_role !== "owner" && <div className="notification-anchor"><button type="button" className="icon-btn" title={t("notifications")}
           aria-label={t("notifications")} aria-expanded={notificationCenterOpen} onClick={() => {
             setNotificationCenterOpen(!notificationCenterOpen);
             refreshNotifications().catch(() => {});
           }}><Bell size={18}/></button>{notificationCenterOpen && <NotificationCenter items={notifications}
           unreadCount={notificationUnreadCount} locale={locale} t={t} onOpen={openNotification}
-          onRead={(item) => updateNotification(item, "read")} onArchive={(item) => updateNotification(item, "archive")}/>}</div>
-      <div className="account-menu-wrap" ref={accountMenuRef}><button type="button" className="account-menu-button" aria-label={t("account")} aria-expanded={accountMenuOpen} onClick={() => setAccountMenuOpen((v)=>!v)}><span className="avatar">{role === "hq_finance" ? "\u7d4c" : role === "manager" ? "\u5e97" : "\u4f50"}</span><span className="role-meta"><b>{data.user?.name || "\u2014"}</b><small>{roleLabel(locale, data.account_role || role)}</small></span><ChevronDown size={16}/></button>{accountMenuOpen && <div className="account-menu-panel"><div className="account-menu-identity"><b>{data.user?.name || "\u2014"}</b><span>{roleLabel(locale, data.account_role || role)}</span></div>{demoAvailable && <div className="select-wrap"><Users size={15}/><select aria-label={t("account")} value={data.user.id} onChange={(event) => login("/api/auth/demo-login", { account_id: Number(event.target.value) })}>{demoAccounts.map((option) => <option value={option.id} key={option.id}>{option.display_name} · {roleLabel(locale, option.role)}{option.store_id ? ` \u00b7 ${option.store_id}` : ""}</option>)}</select><ChevronDown size={13}/></div>}<button className="language-btn" onClick={() => setLocale(locale === "ja" ? "zh" : "ja")} title={t("language")}><Languages size={16}/>{locale === "ja" ? "\u4e2d\u6587" : "\u65e5\u672c\u8a9e"}</button><button className="account-signout" onClick={logout}><LogOut size={16}/>{t("signOut")}</button></div>}</div></div>
+          onRead={(item) => updateNotification(item, "read")} onArchive={(item) => updateNotification(item, "archive")}/>}</div>}
+      <div className="account-menu-wrap" ref={accountMenuRef}><button type="button" className="account-menu-button" aria-label={t("account")} aria-expanded={accountMenuOpen} onClick={() => setAccountMenuOpen((v)=>!v)}><span className="avatar">{role === "hq_finance" ? "\u7d4c" : role === "manager" ? "\u5e97" : "\u4f50"}</span><span className="role-meta"><b>{data.user?.name || "\u2014"}</b><small>{roleLabel(locale, data.account_role || role)}</small></span><ChevronDown size={16}/></button>{accountMenuOpen && <div className="account-menu-panel"><div className="account-menu-identity"><b>{data.user?.name || "\u2014"}</b><span>{roleLabel(locale, data.account_role || role)}</span></div>{demoAvailable && <div className="select-wrap"><Users size={15}/><select aria-label={t("account")} value={data.user.id} onChange={(event) => login("/api/auth/demo-login", { account_id: Number(event.target.value) })}>{demoAccounts.map((option) => <option value={option.id} key={option.id}>{option.display_name} · {roleLabel(locale, option.role)}{option.store_id ? ` \u00b7 ${option.store_id}` : ""}</option>)}</select><ChevronDown size={13}/></div>}<button className="language-btn" onClick={() => setLocale(locale === "ja" ? "zh" : "ja")} title={t("language")}><Languages size={16}/>{locale === "ja" ? "\u4e2d\u6587" : "\u65e5\u672c\u8a9e"}</button><button className="account-signout" onClick={logout}><LogOut size={16}/>{sampleMode ? "管理者ログイン" : t("signOut")}</button></div>}</div></div>
     </header><main className="page-main"><div className="page-content">{!data ? <div className="loading"><div className="spinner"/>Loading SumaiBoard\u2026</div> : <>
       {page === "accounts" && ["hr","administrator"].includes(data.account_role) && <AccountsPage accounts={data.accounts || []} locale={locale} t={t} api={api}/>}
       {page === "change-password" && <PasswordChangePage forced api={api} t={t} onChanged={() => setPage(data.account_role === "hr" ? "accounts" : "dashboard")}/>}
-      {page === "dashboard" && <><Dashboard data={data} summary={summary} tasks={tasks} preferences={preferences} t={t} role={role} locale={locale} workspaceView={workspaceView} onWorkspaceView={setWorkspaceView} api={api} onHousehold={openHousehold} onActivity={() => setModal("activity")} onNavigate={(nextPage) => { setWorkspaceView("home"); setPage(nextPage); }} onReport={(body) => api("/api/report","PUT",{manual_note:body})} onCounter={(counter) => { setBusinessFilter(counter.filter); setPage(counter.target_page); }} onTask={(task) => { const h=data.households.find((item)=>item.id===task.household_id); if(h) openHousehold(h); else { setBusinessFilter(task.task_type==="dispute"?"disputed":"construction:pending"); setPage(task.related_type==="introduction"?"introductions":"revenue"); } }}/>{workspaceView === "home" && <ModuleEntries navItems={navItems} accountRole={data.account_role} t={t} onNavigate={(id)=>{setWorkspaceView("home");setPage(id);}}/>}</>}
+      {page !== "change-password" && <nav className="rental-nav" aria-label="業務メニュー">
+        {navItems.map(([id, label]) => <button className="secondary-btn" type="button" key={id}
+          aria-current={page === id ? "page" : undefined}
+          onClick={() => { setWorkspaceView("home"); setPage(id); }}>{label}</button>)}
+      </nav>}
+      <RentalPage key={`${data.user.id}:${page}`} page={page} apiBase={API_BASE}/>
       {page === "households" && <Households locale={locale} items={filtered} stores={data.stores} t={t} onOpen={openHousehold} businessFilter={businessFilter} matchedTasks={matchedTasks} terminalExcludedTaskCount={terminalExcludedTaskCount} onClearBusinessFilter={() => setBusinessFilter("")} searchFeedback={searchFeedback}/>}
       {page === "introductions" && <Introductions locale={locale} items={filtered} t={t} onOpen={openHousehold}
         onAdd={(household)=>{setSelected(household);setModal("introduction");}} businessFilter={businessFilter}
         onClearBusinessFilter={() => setBusinessFilter("")} focusHouseholdId={introFocusHouseholdId}
         onFocusHandled={() => setIntroFocusHouseholdId(null)} searchFeedback={searchFeedback}/>}
       {page === "revenue" && <Revenue data={data} t={t} role={role} api={api} onOpen={openHousehold} filter={businessFilter} onClearBusinessFilter={() => setBusinessFilter("")}/>}
-      {page === "team" && <section><PageTitle eyebrow={t("collaboration")} title={t("collaboration")}/><div className="trend-controls team-view-tabs">{[["calendar","schedule"],["bulletin","bulletin"],["queue","negotiationQueue"]].map(([view,label])=>{const active=workspaceView===view||(workspaceView==="home"&&view==="calendar");return <button className={`secondary-btn view-tab${active?" is-active":""}`} aria-pressed={active} key={view} onClick={()=>setWorkspaceView(view)}>{t(label)}</button>;})}</div><CollaborationWorkspace displayDate={displayDate} roleLabel={roleLabel} stageLabel={localeLabel} view={workspaceView==="home"?"calendar":workspaceView} data={data} locale={locale} role={role} t={t} api={api} onBack={() => { setWorkspaceView("home"); setPage("dashboard"); }} onTask={()=>{}} onHousehold={openHousehold}/></section>}
-      {page === "management" && <Management key={`${data.user.id}:${role}`} locale={locale} data={data} t={t} role={role}
-        onReminder={handleReminder} onException={(card,record)=>{setBusinessFilter(card.filter);setPage(card.target_page);const target=data.households?.find((household)=>household.id===record.household_id);if(target)openHousehold(target);}}/>}
-      {page === "settings" && <SettingsPage data={data} t={t} role={role} locale={locale} onLocaleChange={setLocale} onReset={async()=>{if(window.confirm(t("resetConfirm"))){await api("/api/reset");setToast(t("resetDone"));}}} onConfigSaved={()=>{load().catch(()=>setToast("API connection failed"));setToast(t("configSaved"));}} preferences={preferences} onSavePreferences={(next)=>api("/api/preferences","PUT",next)}/>}
+      {page === "team" && <section><PageTitle eyebrow={t("collaboration")} title={t("collaboration")}/><div className="trend-controls team-view-tabs">{[["calendar","schedule"],["bulletin","bulletin"]].map(([view,label])=>{const active=workspaceView===view||(workspaceView==="home"&&view==="calendar");return <button className={`secondary-btn view-tab${active?" is-active":""}`} aria-pressed={active} key={view} onClick={()=>setWorkspaceView(view)}>{t(label)}</button>;})}</div><CollaborationWorkspace displayDate={displayDate} roleLabel={roleLabel} stageLabel={localeLabel} view={workspaceView==="home"?"calendar":workspaceView} data={data} locale={locale} role={role} t={t} api={api} onBack={() => { setWorkspaceView("home"); setPage("dashboard"); }} onTask={()=>{}} onHousehold={openHousehold}/></section>}
+      {page === "management" && <div className="admin-page management-page">
+        <PageTitle title={t("management")}/>
+        <AuditTrailPanel t={t} userId={data.user.id} locale={locale}/>
+        <MonthClosePanel accountRole={data.account_role} userId={data.user.id} t={t}/>
+      </div>}
+      {page === "settings" && <SettingsPage data={data} t={t} role={role} locale={locale} onLocaleChange={setLocale} onReset={async()=>{if(window.confirm(t("resetConfirm"))){await api("/api/reset");setToast(t("resetDone"));}}} onConfigSaved={()=>{load().catch(()=>setToast("API connection failed"));setToast(t("configSaved"));}} preferences={preferences} onSavePreferences={(next)=>api("/api/preferences","PUT",next)} sampleMode={sampleMode}/>}
     </>}<footer className="app-footer"><ShieldCheck size={14}/>{t("prototype")} ? {t("demoWarning")}<span>{t("copyright")}</span></footer></div></main>
     {modal === "household" && selected && <HouseholdModal locale={locale} household={selected} t={t} role={role}
       onClose={() => setModal("")} onActivity={() => setModal("activity")} api={api}/>}
@@ -1290,6 +1312,9 @@ function NotificationCenter({ items, unreadCount, locale, t, onOpen, onRead, onA
   </section>;
 }
 
+function SampleWatermark() {
+  return <div className="sample-watermark" aria-hidden="true" />;
+}
 function LoginPage({ locale, setLocale, t, accounts, demoAvailable, error, busy, onLogin }) {
   const [accountId, setAccountId] = useState(accounts[0]?.id || "");
   const [employeeCode, setEmployeeCode] = useState("");
@@ -2503,7 +2528,7 @@ function ImportResultTable({ rows, t, importReason }) {
       <td>{t(row.status === "READY" ? "previewReady" : `importStatus${row.status}`)}</td><td>{importReason(row.reason)}</td>
     </tr>)}</tbody></table></div>;
 }
-function SettingsPage({ data, t, role, locale, onLocaleChange, onReset, onConfigSaved, preferences, onSavePreferences }) {
+function SettingsPage({ data, t, role, locale, onLocaleChange, onReset, onConfigSaved, preferences, onSavePreferences, sampleMode }) {
   return <div className="admin-page settings-page"><PageTitle eyebrow={t("systemPreferences")} title={t("settings")} sub={t("settingsSub")}/>
     <div className="settings-grid"><section className="panel setting-card"><div className="setting-icon"><Users size={19}/></div><div><h2>{t("role")}</h2><p>{t("currentRole")}：{roleLabel(locale, role)}。{t("roleDescription")}</p>
       <div className="setting-roles">{data.roles.map((r) => <span className={`role-chip ${r.id === role ? "current" : ""}`} key={r.id}>{roleLabel(locale, r.id)} {r.id === role && <Check size={13}/>}</span>)}</div></div></section>
@@ -2514,9 +2539,9 @@ function SettingsPage({ data, t, role, locale, onLocaleChange, onReset, onConfig
     <PreferencePanel preferences={preferences} t={t} onSave={onSavePreferences}/>
     <AuditTrailPanel t={t} userId={data.user.id} locale={locale}/>
     <ExpensePanel data={data} t={t} role={role} accountRole={data.account_role} locale={locale}/>
-    <DataExchangePanel data={data} t={t} locale={locale}/>
+    {!sampleMode && <DataExchangePanel data={data} t={t} locale={locale}/>}
     <MonthClosePanel accountRole={data.account_role} userId={data.user.id} t={t}/>
-    <DataCorrectionPanel accountRole={data.account_role} t={t} locale={locale}/>
+    {!sampleMode && <DataCorrectionPanel accountRole={data.account_role} t={t} locale={locale}/>}
     <OperationsPanel accountRole={data.account_role} locale={locale} t={t}/>
     <section className="panel config-panel"><div className="panel-head"><div><div className="eyebrow">{t("versionedOperations")}</div><h2>{t("systemConfig")}</h2></div><ShieldCheck size={17} className="green-text"/></div>
       {role === "hq_finance" ? <SystemConfigPanel role={role} locale={locale} t={t} onSaved={onConfigSaved}/> :
