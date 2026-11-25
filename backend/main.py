@@ -413,6 +413,14 @@ STORES = [
     ("店舗I", "愛知"), ("店舗J", "大阪"), ("店舗K", "兵庫"), ("店舗L", "福岡"),
 ]
 STAGES = ["新規予約", "初回相談済", "FP診断済", "紹介済", "訪問・商談中", "契約", "着工", "完了・見送り"]
+DEMO_EMPLOYEE_CODES = (
+    *(f"AD-{store_id:02}-{slot}" for store_id in range(1, 13) for slot in (1, 2)),
+    *(f"SM-{store_id:02}" for store_id in range(1, 13)),
+    "EX-01", "FN-01", "AM-01", "FN-02", "HR-01", "HR-02",
+    *(f"HQ-{index:02}" for index in range(1, 5)),
+)
+SAMPLE_IDENTITY_CODES = frozenset((*DEMO_EMPLOYEE_CODES, "OW-A", "OW-B"))
+SAMPLE_SEED_COMPLETED_KEY = "sample_seed_completed"
 SEED_BATCH = "mallboard-demo-2026-11-full-v2"
 SAMPLE_SURNAMES = ["佐藤", "田中", "鈴木", "高橋", "伊藤", "渡辺", "山本", "中村", "小林", "加藤", "吉田", "山田"]
 SAMPLE_SURNAMES_KANA = ["サトウ", "タナカ", "スズキ", "タカハシ", "イトウ", "ワタナベ", "ヤマモト", "ナカムラ", "コバヤシ", "カトウ", "ヨシダ", "ヤマダ"]
@@ -1323,6 +1331,7 @@ def demo_accounts(request: Request):
                               "user_agent": request.headers.get("user-agent", "")[:200]}))
             db.commit()
         raise HTTPException(403, "デモモードは無効です")
+    sample_mode = public_sample_mode_enabled()
     with connect() as db:
         return {"accounts": [
             {"id": row["id"], "employee_code": row["employee_code"], "display_name": row["display_name"],
@@ -1331,6 +1340,7 @@ def demo_accounts(request: Request):
                 "SELECT id,employee_code,display_name,role,store_id FROM users "
                 "WHERE account_status='ACTIVE' AND employee_code IS NOT NULL ORDER BY role,store_id,employee_code"
             )
+            if not sample_mode or row["employee_code"] in SAMPLE_IDENTITY_CODES
         ]}
 
 
@@ -1349,7 +1359,9 @@ def demo_login(payload: DemoLoginInput, request: Request, response: Response):
         ).fetchone()
         if not user:
             raise HTTPException(401, "認証が必要です")
-        if user["employee_code"] is None:
+        if user["employee_code"] is None or (
+            public_sample_mode_enabled() and user["employee_code"] not in SAMPLE_IDENTITY_CODES
+        ):
             raise HTTPException(403, "デモアカウントではありません")
         if user["account_status"] != "ACTIVE":
             raise HTTPException(401, "認証が必要です")
@@ -1970,16 +1982,10 @@ def ensure_demo_accounts(db):
                 (display_name, role, store_id, employee_code, str(uuid.uuid4()), display_name,
                  hash_secret(secrets.token_urlsafe(32))),
             )
-    demo_employee_codes = [
-        *(f"AD-{store_id:02}-{slot}" for store_id in range(1, 13) for slot in (1, 2)),
-        *(f"SM-{store_id:02}" for store_id in range(1, 13)),
-        "EX-01", "FN-01", "AM-01", "FN-02", "HR-01", "HR-02",
-        *(f"HQ-{index:02}" for index in range(1, 5)),
-    ]
-    placeholders = ",".join("?" for _ in demo_employee_codes)
+    placeholders = ",".join("?" for _ in DEMO_EMPLOYEE_CODES)
     db.execute(
         f"UPDATE users SET must_change_password=0 WHERE employee_code IN ({placeholders})",
-        demo_employee_codes,
+        DEMO_EMPLOYEE_CODES,
     )
     count = db.execute("SELECT COUNT(*) AS count FROM users WHERE role <> 'owner'").fetchone()["count"]
     if count != 46:
@@ -2069,6 +2075,11 @@ def seed(db):
     rental.ensure_rental_schema(db)
     if public_sample_mode_enabled():
         rental.seed_rental(db)
+        db.execute(
+            """INSERT INTO system_configs (config_key,value_json,updated_at) VALUES (?,?,UTC_TIMESTAMP())
+               ON DUPLICATE KEY UPDATE value_json=VALUES(value_json),updated_at=VALUES(updated_at)""",
+            (SAMPLE_SEED_COMPLETED_KEY, "1"),
+        )
 
 
 def _seed_legacy(db):
@@ -2622,13 +2633,73 @@ def _seed_legacy(db):
     )
 
 
+def database_tables(db):
+    return {row[0] for row in db.execute(
+        "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE()"
+    )}
+
+
+def referral_reset_storage_keys(db):
+    return [row["storage_key"] for row in db.execute(
+        "SELECT storage_key FROM referral_document_files"
+    )]
+
+
+def rebuild_demo_data(db, tables, referral_storage_keys, session_token=None, audit_user_id=None):
+    sample_mode = public_sample_mode_enabled()
+    if "system_configs" in tables:
+        db.execute(
+            "DELETE FROM system_configs WHERE config_key IN (?,?)",
+            (SAMPLE_SEED_COMPLETED_KEY, rental.SEED_COMPLETED_KEY),
+        )
+        # The table survives reset. Persist invalidation before cleanup or DDL can fail.
+        if sample_mode:
+            db.commit()
+    if "auth_sessions" in tables:
+        if sample_mode:
+            db.execute("DELETE FROM auth_sessions")
+        elif session_token:
+            db.execute("DELETE FROM auth_sessions WHERE token_hash<>?", (token_digest(session_token),))
+    for table in ("password_reset_tokens", "auth_login_attempts", "password_history",
+                  "notification_deliveries", "notifications"):
+        if table in tables:
+            db.execute(f"DELETE FROM `{table}`")
+    if audit_user_id is not None:
+        audit(db, audit_user_id, "DEMO_DATA_RESET", "seed", None, f"batch={SEED_BATCH}")
+    for table in TABLES:
+        db.execute(f"DROP TABLE IF EXISTS `{table}`")
+    for storage_key in referral_storage_keys:
+        if Path(storage_key).name == storage_key:
+            (REFERRAL_STORAGE_DIR / storage_key).unlink(missing_ok=True)
+    seed(db)
+
+
+def sample_seed_is_complete(db, tables):
+    if "system_configs" not in tables:
+        return False
+    markers = db.execute(
+        "SELECT value_json FROM system_configs WHERE config_key IN (?,?)",
+        (SAMPLE_SEED_COMPLETED_KEY, rental.SEED_COMPLETED_KEY),
+    ).fetchall()
+    return len(markers) == 2 and all(str(row[0]) == "1" for row in markers)
+
+
+recovering_sample = False
 for attempt in range(60):
     try:
         with connect() as db:
-            seed(db)
+            if public_sample_mode_enabled():
+                tables = database_tables(db)
+                if not sample_seed_is_complete(db, tables):
+                    recovering_sample = True
+                    rental.check_rental_reset_scope(db, existing_tables=tables)
+                    storage_keys = referral_reset_storage_keys(db) if "referral_document_files" in tables else []
+                    rebuild_demo_data(db, tables, storage_keys)
+            else:
+                seed(db)
         break
     except pymysql.MySQLError:
-        if attempt == 59:
+        if recovering_sample or attempt == 59:
             raise
         time.sleep(2)
 
@@ -5050,36 +5121,18 @@ def reset_demo(request: Request, x_demo_role: CurrentActor = Depends(require_act
     guard = request.state.sample_guard
     with connect() as db:
         rental.check_rental_reset_scope(db)
-        referral_storage_keys = [
-            row["storage_key"] for row in db.execute(
-                "SELECT storage_key FROM referral_document_files"
-            ).fetchall()
-        ]
+        referral_storage_keys = referral_reset_storage_keys(db)
 
     # MySQL commits DDL implicitly. Rebuild from scratch on a fresh
     # connection if an earlier attempt failed partway through.
     for attempt in range(2):
         try:
             with connect() as db:
-                session_token = request.cookies.get(SESSION_COOKIE)
-                db.execute("DELETE FROM system_configs WHERE config_key=?", (rental.SEED_COMPLETED_KEY,))
-                if public_sample_mode_enabled():
-                    db.execute("DELETE FROM auth_sessions")
-                elif session_token:
-                    db.execute("DELETE FROM auth_sessions WHERE token_hash<>?", (token_digest(session_token),))
-                db.execute("DELETE FROM password_reset_tokens")
-                db.execute("DELETE FROM auth_login_attempts")
-                db.execute("DELETE FROM password_history")
-                db.execute("DELETE FROM notification_deliveries")
-                db.execute("DELETE FROM notifications")
-                if attempt == 0:
-                    audit(db, x_demo_role.user_id, "DEMO_DATA_RESET", "seed", None, f"batch={SEED_BATCH}")
-                for table in TABLES:
-                    db.execute(f"DROP TABLE IF EXISTS `{table}`")
-                for storage_key in referral_storage_keys:
-                    if Path(storage_key).name == storage_key:
-                        (REFERRAL_STORAGE_DIR / storage_key).unlink(missing_ok=True)
-                seed(db)
+                rebuild_demo_data(
+                    db, database_tables(db), referral_storage_keys,
+                    session_token=request.cookies.get(SESSION_COOKIE),
+                    audit_user_id=x_demo_role.user_id if attempt == 0 else None,
+                )
         except Exception:
             logging.exception("Demo reset attempt %d failed", attempt + 1)
             if attempt == 1:

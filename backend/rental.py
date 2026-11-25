@@ -292,8 +292,10 @@ def ensure_rental_schema(db):
         db.execute("INSERT INTO rental_schema_migrations VALUES (?, UTC_TIMESTAMP())", (version,))
 
 
-def check_rental_reset_scope(db):
+def check_rental_reset_scope(db, *, existing_tables=None):
     for table in RENTAL_RESET_TABLES:
+        if existing_tables is not None and table not in existing_tables:
+            continue
         if db.execute(f"SELECT 1 FROM {table} WHERE tenant_id <> ? LIMIT 1", (TENANT_ID,)).fetchone():
             raise HTTPException(409, "サンプル以外の賃貸管理データがあるためリセットできません")
 
