@@ -85,7 +85,7 @@ export default function RentalPage({ page, apiBase, accountRole, userId }) {
             : page === "repairs" ? <RentalRepairs apiBase={apiBase}/>
             : page === "settlements" ? <RentalSettlements apiBase={apiBase} accountRole={accountRole} userId={userId}/>
               : page === "funds" ? <RentalFunds apiBase={apiBase}/>
-              : <p className="panel">準備中</p>}
+              : accountRole === "owner" ? <OwnerPortal apiBase={apiBase}/> : null}
   </section>;
 }
 
@@ -1506,4 +1506,122 @@ function RentalRepairs({ apiBase }) {
         : <CaseList key={tab} apiBase={apiBase} tab={tab} open={open}
           create={() => setHistory([{ resource: tab }])}/>}
   </>;
+}
+
+function OwnerSummary({ apiBase }) {
+  const result = useRentalData(apiBase, "owner/summary");
+  return <RentalResult result={result}>{(data) => {
+    const actual = data.latest_actual_remittance;
+    const scheduled = data.latest_scheduled_remittance;
+    return <section aria-labelledby="owner-summary">
+      <h2 id="owner-summary">今月の模擬送金（{data.month.slice(0, 7)}）</h2>
+      <div className="rental-metrics">
+        <div className="panel rental-metric"><span>最新の模擬送金実績</span>
+          <strong>{actual ? yen.format(actual.actual_amount) : "実績なし"}</strong>
+          {actual && <small>{actual.remitted_date}</small>}
+        </div>
+        <div className="panel rental-metric"><span>最新の模擬送金予定</span>
+          <strong>{scheduled ? yen.format(scheduled.scheduled_amount) : "予定なし"}</strong>
+          {scheduled && <small>{scheduled.scheduled_date}</small>}
+        </div>
+        <div className="panel rental-metric"><span>年間累計の模擬送金額</span>
+          <strong>{yen.format(data.annual_remitted_amount)}</strong>
+        </div>
+        <div className="panel rental-metric"><span>{data.cumulative_balance_label}</span>
+          <strong>{yen.format(data.cumulative_balance)}</strong><small>{data.cumulative_balance_note}</small>
+        </div>
+        <div className="panel rental-metric"><span>管理戸数・入居率</span>
+          <strong>{number.format(data.managed_unit_count)} 戸 · {percent.format(data.occupancy_rate)}</strong>
+          <small>入居 {number.format(data.occupied_unit_count)} 戸</small>
+        </div>
+      </div>
+    </section>;
+  }}</RentalResult>;
+}
+
+function OwnerList({ apiBase, resource, render, empty }) {
+  const [offset, setOffset] = useState(0);
+  const separator = resource.includes("?") ? "&" : "?";
+  const result = useRentalData(apiBase, `owner/${resource}${separator}offset=${offset}`);
+  return <RentalResult result={result}>{(rows) => <>
+    <MoneyList rows={rows} render={render} empty={empty}/>
+    <Pager offset={offset} count={rows.length} setOffset={setOffset}/>
+  </>}</RentalResult>;
+}
+
+function OwnerSettlement({ apiBase, id }) {
+  const result = useRentalData(apiBase, `owner/settlements/${id}`);
+  return <RentalResult result={result}>{(row) => <>
+    <div className="panel rental-metric">
+      <h3>{row.settlement_month.slice(0, 7)} · {row.contract_code}</h3>
+      <RecordValues row={{
+        ...row, management_fee: 0 - row.management_fee, approved_expenses: 0 - row.approved_expenses,
+        adjustment_amount: 0 - row.adjustment_amount,
+      }} fields={[
+        ["opening_available_balance", "期首残高", "money"],
+        ["collected_income", "収納額", "money"], ["management_fee", "管理料", "money"],
+        ["approved_expenses", "修繕控除", "money"], ["adjustment_amount", "調整額", "money"],
+        ["payable_amount", "模擬送金予定額", "money"], ["closing_available_balance", "期末残高", "money"],
+        ["outstanding_expense_balance", "未控除費用", "money"],
+      ]}/>
+    </div>
+    <h3>精算明細</h3>
+    <MoneyList rows={row.lines} empty="精算明細はありません。" render={(line) => <MoneyRow
+      title={settlementLineLabels[line.line_type] || line.line_type}
+      description={[line.description, line.source_month?.slice(0, 7)].filter(Boolean).join(" · ")}
+      balance={yen.format(["MANAGEMENT_FEE", "REPAIR", "ADJUSTMENT"].includes(line.line_type)
+        ? 0 - line.amount : line.amount)}/>}/>
+    <h3>模擬送金履歴</h3>
+    <MoneyList rows={row.remittances} empty="模擬送金の記録はありません。" render={(item) => <MoneyRow
+      title={remittanceStatuses[item.status]} description={item.remitted_date || item.scheduled_date}
+      balance={yen.format(item.actual_amount ?? item.scheduled_amount)}/>}/>
+  </>}</RentalResult>;
+}
+
+function OwnerPortal({ apiBase }) {
+  const [settlementId, setSettlementId] = useState(null);
+  const [showHistory, setShowHistory] = useState(false);
+  return <div className="rental-stack owner-portal">
+    <p className="rental-disclaimer">共有サンプル環境です。表示データは架空で、送金はすべて模擬送金です。</p>
+    <OwnerSummary apiBase={apiBase}/>
+    <section aria-labelledby="owner-properties">
+      <h2 id="owner-properties">物件・入居状況</h2>
+      <OwnerList apiBase={apiBase} resource="properties" empty="現在所有する部屋はありません。"
+        render={(row) => <MoneyRow title={`${row.building_name} ${row.unit_number}`}
+          description={statuses[row.occupancy_status]}
+          balance={row.rent_amount == null ? "賃料 —" : `賃料 ${yen.format(row.rent_amount)}`}/>}/>
+      <button type="button" className="secondary-btn" aria-expanded={showHistory}
+        onClick={() => setShowHistory(!showHistory)}>管理契約の履歴</button>
+      {showHistory && <OwnerList apiBase={apiBase} resource="properties?history=true" empty="管理契約の履歴はありません。"
+        render={(row) => <MoneyRow title={`${row.building_name} ${row.unit_number}`}
+          description={row.contract_code} balance={`${row.valid_from} 〜 ${row.valid_to || "—"}`}/>}/>}
+    </section>
+    <section aria-labelledby="owner-settlements">
+      <h2 id="owner-settlements">確定済みの精算</h2>
+      <div hidden={settlementId !== null}>
+        <OwnerList apiBase={apiBase} resource="settlements" empty="確定済みの精算はありません。"
+          render={(row) => <MoneyRow title={`${row.settlement_month.slice(0, 7)} · ${row.contract_code}`}
+            description={row.settlement_code} balance={`模擬送金予定 ${yen.format(row.payable_amount)}`}
+            onClick={() => setSettlementId(row.id)} actionLabel="精算詳細"/>}/>
+      </div>
+      {settlementId !== null && <div className="rental-stack">
+        <div className="rental-controls"><button type="button" className="secondary-btn"
+          onClick={() => setSettlementId(null)}>精算一覧に戻る</button></div>
+        <OwnerSettlement apiBase={apiBase} id={settlementId}/>
+      </div>}
+    </section>
+    <section aria-labelledby="owner-repairs">
+      <h2 id="owner-repairs">修繕履歴</h2>
+      <OwnerList apiBase={apiBase} resource="repairs" empty="修繕履歴はありません。"
+        render={(row) => <div className="owner-repair rental-metric">
+          <strong>{row.building_name} {row.unit_number}</strong>
+          <small>{statuses[row.category]} · {statuses[row.status]}</small>
+          <RecordValues row={row} fields={[
+            ["cost_bearer", "費用負担"], ["estimated_amount", "見積額", "money"],
+            ["approved_amount", "承認額", "money"], ["actual_amount", "実費", "money"],
+            ["completed_date", "完了日"],
+          ]}/>
+        </div>}/>
+    </section>
+  </div>;
 }

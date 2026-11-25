@@ -10,7 +10,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pymysql.err import IntegrityError, OperationalError
 
 TENANT_ID = 1
@@ -650,6 +650,195 @@ def register_rental_routes(app, connect, require_actor, audit):
     def summary():
         with connect() as db:
             return rental_summary(db, datetime.now(JST).date())
+
+    def require_owner(response: Response, actor=Depends(require_actor)):
+        if actor.account_role != "owner":
+            raise HTTPException(403, "オーナーマイページへのアクセス権限がありません")
+        with connect() as db:
+            account = db.execute(
+                """SELECT oa.party_id FROM owner_accounts oa
+                   JOIN parties p ON p.tenant_id=oa.tenant_id AND p.id=oa.party_id
+                   WHERE oa.tenant_id=? AND oa.user_id=?""", (TENANT_ID, actor.user_id),
+            ).fetchone()
+        if not account:
+            raise HTTPException(403, "オーナーマイページへのアクセス権限がありません")
+        response.headers["Cache-Control"] = "private, no-store"
+        return account["party_id"]
+
+    owner_settlement_scope = """
+        FROM owner_settlements s JOIN management_contracts c
+          ON c.tenant_id=s.tenant_id AND c.id=s.management_contract_id
+        WHERE s.tenant_id=? AND c.owner_party_id=? AND s.status='FINALIZED'
+    """
+    owner_settlement_fields = """
+        s.id, s.settlement_code, s.settlement_month, s.status, c.contract_code,
+        s.collected_income, s.management_fee, s.approved_expenses, s.adjustment_amount,
+        s.payable_amount, s.opening_available_balance, s.closing_available_balance,
+        s.outstanding_expense_balance
+    """
+    owner_remittance_scope = """
+        FROM owner_remittances r
+        JOIN owner_settlements s ON s.tenant_id=r.tenant_id AND s.id=r.settlement_id
+        JOIN management_contracts c ON c.tenant_id=s.tenant_id AND c.id=s.management_contract_id
+        WHERE s.tenant_id=? AND c.owner_party_id=? AND s.status='FINALIZED'
+    """
+
+    @router.get("/owner/summary")
+    def owner_summary(owner_id=Depends(require_owner)):
+        today = datetime.now(JST).date()
+        month = today.replace(day=1)
+        next_month = _month_shift(month, 1)
+        year = today.replace(month=1, day=1)
+        with connect() as db:
+            occupancy = db.execute(
+                """SELECT COUNT(*) AS managed_unit_count, COALESCE(SUM(EXISTS (
+                       SELECT 1 FROM leases l WHERE l.tenant_id=u.tenant_id AND l.unit_id=u.id
+                       AND l.status IN ('OCCUPIED','TERMINATION_PENDING','ENDED')
+                       AND l.actual_move_in_date<=?
+                       AND (l.actual_move_out_date IS NULL OR l.actual_move_out_date>?)
+                   )),0) AS occupied_unit_count
+                   FROM units u WHERE u.tenant_id=? AND u.owner_party_id=? AND EXISTS (
+                       SELECT 1 FROM management_contract_units cu
+                       JOIN management_contracts c ON c.tenant_id=cu.tenant_id AND c.id=cu.management_contract_id
+                       WHERE cu.tenant_id=u.tenant_id AND cu.unit_id=u.id AND c.owner_party_id=u.owner_party_id
+                       AND c.status IN ('ACTIVE','ENDED')
+                       AND cu.valid_from<=? AND (cu.valid_to IS NULL OR cu.valid_to>=?)
+                       AND c.start_date<=? AND (c.end_date IS NULL OR c.end_date>=?)
+                   )""", (today, today, TENANT_ID, owner_id, today, today, today, today),
+            ).fetchone()
+            latest_actual = db.execute(
+                f"""SELECT r.settlement_id, r.actual_amount, r.remitted_date {owner_remittance_scope}
+                    AND r.status='SIMULATED_REMITTED' AND r.remitted_date>=? AND r.remitted_date<=?
+                    ORDER BY r.remitted_date DESC, r.id DESC LIMIT 1""",
+                (TENANT_ID, owner_id, month, today),
+            ).fetchone()
+            latest_schedule = db.execute(
+                f"""SELECT r.settlement_id, r.scheduled_amount, r.scheduled_date {owner_remittance_scope}
+                    AND r.status='SCHEDULED' AND r.scheduled_date>=? AND r.scheduled_date<?
+                    AND NOT EXISTS (
+                        SELECT 1 FROM owner_settlements next_settlement
+                        WHERE next_settlement.tenant_id=s.tenant_id
+                          AND next_settlement.management_contract_id=s.management_contract_id
+                          AND next_settlement.status='FINALIZED'
+                          AND CAST(JSON_UNQUOTE(JSON_EXTRACT(next_settlement.calculation_snapshot,
+                              '$.carry_in.settlement_id')) AS DECIMAL(20,0))=s.id
+                    )
+                    ORDER BY r.scheduled_date DESC, r.id DESC LIMIT 1""",
+                (TENANT_ID, owner_id, month, next_month),
+            ).fetchone()
+            annual = db.execute(
+                f"""SELECT COALESCE(SUM(r.actual_amount),0) AS amount {owner_remittance_scope}
+                    AND r.status='SIMULATED_REMITTED' AND r.remitted_date>=? AND r.remitted_date<=?""",
+                (TENANT_ID, owner_id, year, today),
+            ).fetchone()["amount"]
+            cumulative = db.execute(
+                f"""SELECT COALESCE(SUM(s.collected_income-s.management_fee-s.approved_expenses),0) AS amount
+                    {owner_settlement_scope}""", (TENANT_ID, owner_id),
+            ).fetchone()["amount"]
+        managed = int(occupancy["managed_unit_count"])
+        occupied = int(occupancy["occupied_unit_count"])
+        return {
+            "month": month, "remittance_label": "模擬送金",
+            "latest_actual_remittance": latest_actual, "latest_scheduled_remittance": latest_schedule,
+            "annual_remitted_amount": int(annual),
+            "cumulative_balance": int(cumulative), "cumulative_balance_label": "管理範囲内の累積収支",
+            "cumulative_balance_note": "融資・税金・減価償却は含みません。",
+            "managed_unit_count": managed, "occupied_unit_count": occupied,
+            "occupancy_rate": occupied / managed if managed else 0,
+        }
+
+    @router.get("/owner/properties")
+    def owner_properties(history: bool = False, limit: int = Query(50, ge=1, le=100),
+                         offset: int = Query(0, ge=0), owner_id=Depends(require_owner)):
+        today = datetime.now(JST).date()
+        with connect() as db:
+            if history:
+                return db.execute(
+                    """SELECT cu.id, b.id AS building_id, b.building_name, u.id AS unit_id, u.unit_number,
+                              c.contract_code, cu.valid_from, cu.valid_to
+                       FROM management_contracts c
+                       JOIN management_contract_units cu ON cu.tenant_id=c.tenant_id AND cu.management_contract_id=c.id
+                       JOIN units u ON u.tenant_id=cu.tenant_id AND u.id=cu.unit_id
+                       JOIN buildings b ON b.tenant_id=u.tenant_id AND b.id=u.building_id
+                       WHERE c.tenant_id=? AND c.owner_party_id=? AND c.status IN ('ACTIVE','ENDED')
+                         AND cu.valid_from<=?
+                         AND (u.owner_party_id<>c.owner_party_id OR cu.valid_to<? OR c.end_date<?)
+                       ORDER BY b.id,u.id,cu.valid_from DESC,cu.id DESC LIMIT ? OFFSET ?""",
+                    (TENANT_ID, owner_id, today, today, today, limit, offset),
+                ).fetchall()
+            return db.execute(
+                """SELECT u.id, b.id AS building_id, b.building_name, u.unit_number, u.occupancy_status,
+                          (SELECT l.rent_amount FROM leases l
+                           WHERE l.tenant_id=u.tenant_id AND l.unit_id=u.id
+                             AND l.status IN ('SIGNED','OCCUPIED','TERMINATION_PENDING','ENDED')
+                             AND l.start_date<=? AND (l.actual_move_out_date IS NULL OR l.actual_move_out_date>?)
+                             AND ((l.status IN ('OCCUPIED','TERMINATION_PENDING','ENDED') AND l.actual_move_in_date<=?)
+                                  OR (l.status='SIGNED' AND (l.scheduled_end_date IS NULL OR l.scheduled_end_date>=?)))
+                           ORDER BY l.start_date DESC,l.id DESC LIMIT 1) AS rent_amount
+                   FROM units u JOIN buildings b ON b.tenant_id=u.tenant_id AND b.id=u.building_id
+                   WHERE u.tenant_id=? AND u.owner_party_id=?
+                   ORDER BY b.id,u.unit_number,u.id LIMIT ? OFFSET ?""",
+                (today, today, today, today, TENANT_ID, owner_id, limit, offset),
+            ).fetchall()
+
+    @router.get("/owner/settlements")
+    def owner_settlements(limit: int = Query(50, ge=1, le=100),
+                          offset: int = Query(0, ge=0), owner_id=Depends(require_owner)):
+        with connect() as db:
+            return db.execute(
+                f"""SELECT {owner_settlement_fields} {owner_settlement_scope}
+                    ORDER BY s.settlement_month DESC,s.id DESC LIMIT ? OFFSET ?""",
+                (TENANT_ID, owner_id, limit, offset),
+            ).fetchall()
+
+    @router.get("/owner/settlements/{settlement_id}")
+    def owner_settlement(settlement_id: int, owner_id=Depends(require_owner)):
+        with connect() as db:
+            row = db.execute(
+                f"SELECT {owner_settlement_fields} {owner_settlement_scope} AND s.id=?",
+                (TENANT_ID, owner_id, settlement_id),
+            ).fetchone()
+            if not row:
+                # The status of another owner's settlement is never disclosed.
+                foreign = db.execute(
+                    """SELECT 1 FROM owner_settlements s JOIN management_contracts c
+                         ON c.tenant_id=s.tenant_id AND c.id=s.management_contract_id
+                       WHERE s.tenant_id=? AND s.id=? AND c.owner_party_id<>?""",
+                    (TENANT_ID, settlement_id, owner_id),
+                ).fetchone()
+                if foreign:
+                    raise HTTPException(403, "この精算へのアクセス権限がありません")
+                raise HTTPException(404, "確定済みの精算が見つかりません")
+            row["lines"] = db.execute(
+                f"""SELECT l.id,l.line_type,CASE WHEN l.line_type<>'ADJUSTMENT' THEN l.description END AS description,
+                           l.amount,l.tax_amount,l.source_month
+                    FROM settlement_lines l JOIN (
+                        SELECT s.tenant_id,s.id {owner_settlement_scope} AND s.id=?
+                    ) published ON published.tenant_id=l.tenant_id AND published.id=l.settlement_id
+                    ORDER BY l.id""", (TENANT_ID, owner_id, settlement_id),
+            ).fetchall()
+            row["remittances"] = db.execute(
+                f"""SELECT r.id,r.status,r.scheduled_amount,r.actual_amount,r.scheduled_date,r.remitted_date
+                    {owner_remittance_scope} AND s.id=? ORDER BY r.id""", (TENANT_ID, owner_id, settlement_id),
+            ).fetchall()
+            row["remittance_label"] = "模擬送金"
+            return row
+
+    @router.get("/owner/repairs")
+    def owner_repairs(limit: int = Query(50, ge=1, le=100),
+                      offset: int = Query(0, ge=0), owner_id=Depends(require_owner)):
+        with connect() as db:
+            return db.execute(
+                """SELECT w.id,w.work_order_code,w.category,w.status,w.cost_bearer,w.estimated_amount,
+                          w.approved_amount,w.actual_amount,w.completed_date,b.building_name,u.unit_number
+                   FROM work_orders w
+                   JOIN management_contracts c ON c.tenant_id=w.tenant_id AND c.id=w.management_contract_id
+                   JOIN units u ON u.tenant_id=w.tenant_id AND u.id=w.unit_id AND u.building_id=w.building_id
+                   JOIN buildings b ON b.tenant_id=u.tenant_id AND b.id=u.building_id
+                   WHERE w.tenant_id=? AND c.owner_party_id=?
+                   ORDER BY w.received_date DESC,w.id DESC LIMIT ? OFFSET ?""",
+                (TENANT_ID, owner_id, limit, offset),
+            ).fetchall()
 
     snapshot_fields = (
         "plan_code", "plan_version", "rate", "calculation_basis", "tax_inclusive",

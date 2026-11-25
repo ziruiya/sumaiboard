@@ -910,3 +910,15 @@
 .rental-error { color: #9f1239; }
 .rental-error button { margin-inline-start: 0.5rem; }
 .rental-disclaimer { margin: 0; }
+
+.owner-portal {
+  overflow-wrap: anywhere;
+}
+
+.owner-repair > strong {
+  font-size: 1rem;
+}
+
+.owner-portal button {
+  min-height: 44px;
+}
