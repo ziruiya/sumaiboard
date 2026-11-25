@@ -1260,7 +1260,7 @@ function App() {
       {page === "management" && <div className="admin-page management-page">
         <PageTitle title={t("management")}/>
         <AuditTrailPanel t={t} userId={data.user.id} locale={locale}/>
-        <MonthClosePanel accountRole={data.account_role} userId={data.user.id} t={t}/>
+        {!sampleMode && <MonthClosePanel accountRole={data.account_role} userId={data.user.id} t={t}/>}
       </div>}
       {page === "settings" && <SettingsPage data={data} t={t} role={role} locale={locale} onLocaleChange={setLocale} onReset={async()=>{if(window.confirm(t("resetConfirm"))){await api("/api/reset");setToast(t("resetDone"));}}} onConfigSaved={()=>{load().catch(()=>setToast("API connection failed"));setToast(t("configSaved"));}} preferences={preferences} onSavePreferences={(next)=>api("/api/preferences","PUT",next)} sampleMode={sampleMode}/>}
     </>}<footer className="app-footer"><ShieldCheck size={14}/>{t("prototype")} ? {t("demoWarning")}<span>{t("copyright")}</span></footer></div></main>
@@ -2541,7 +2541,7 @@ function SettingsPage({ data, t, role, locale, onLocaleChange, onReset, onConfig
     <AuditTrailPanel t={t} userId={data.user.id} locale={locale}/>
     <ExpensePanel data={data} t={t} role={role} accountRole={data.account_role} locale={locale}/>
     {!sampleMode && <DataExchangePanel data={data} t={t} locale={locale}/>}
-    <MonthClosePanel accountRole={data.account_role} userId={data.user.id} t={t}/>
+    {!sampleMode && <MonthClosePanel accountRole={data.account_role} userId={data.user.id} t={t}/>}
     {!sampleMode && <DataCorrectionPanel accountRole={data.account_role} t={t} locale={locale}/>}
     <OperationsPanel accountRole={data.account_role} locale={locale} t={t}/>
     <section className="panel config-panel"><div className="panel-head"><div><div className="eyebrow">{t("versionedOperations")}</div><h2>{t("systemConfig")}</h2></div><ShieldCheck size={17} className="green-text"/></div>

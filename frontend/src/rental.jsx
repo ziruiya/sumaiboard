@@ -95,7 +95,7 @@ function RentalProperties({ apiBase }) {
           </tr> : <tr key={row.id}>
             <td>{row.building_name}</td><td>{row.unit_number}</td>
             <td>{yen.format(row.advertised_rent)}</td><td>{yen.format(row.advertised_common_fee)}</td>
-            <td>{{ OCCUPIED: "入居中", VACANT: "空室", TERMINATION_PENDING: "解約予定" }[row.occupancy_status] || row.occupancy_status}</td>
+            <td>{{ OCCUPIED: "入居中", VACANT: "空室", APPLYING: "申込中", CONTRACTING: "契約手続中", TERMINATION_PENDING: "解約予定" }[row.occupancy_status] || row.occupancy_status}</td>
           </tr>)}
         </tbody></table>
       </div>}

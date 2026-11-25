@@ -583,7 +583,6 @@ _SAMPLE_EXACT = {
         "/api/health", "/api/public-config", "/api/bootstrap", "/api/auth/demo-accounts",
         "/api/notifications", "/api/calendar", "/api/bulletin", "/api/audit-events",
         "/api/system-config", "/api/accounts", "/api/operations/status",
-        "/api/month-closes", "/api/month-closes/lock-matrix",
     },
     "POST": {
         "/api/auth/login", "/api/auth/logout", "/api/auth/demo-login", "/api/auth/guest-login",
@@ -716,7 +715,16 @@ class SampleGuardMiddleware:
         while self.write_windows and next(iter(self.write_windows.values()))[-1] <= cutoff:
             self.write_windows.popitem(last=False)
         token = request.cookies.get(SESSION_COOKIE)
-        key = ("session", token) if token else ("ip", request.client.host if request.client else None)
+        key = ("ip", request.client.host if request.client else None)
+        if token:
+            with connect() as db:
+                session = db.execute(
+                    """SELECT 1 FROM auth_sessions WHERE token_hash=? AND revoked_at IS NULL
+                       AND expires_at>?""",
+                    (token_digest(token), now_jst()),
+                ).fetchone()
+            if session:
+                key = ("session", token)
         window = self.write_windows.setdefault(key, deque())
         while window and window[0] <= cutoff:
             window.popleft()
@@ -724,6 +732,8 @@ class SampleGuardMiddleware:
             return False
         window.append(now)
         self.write_windows.move_to_end(key)
+        if len(self.write_windows) > 4096:
+            self.write_windows.popitem(last=False)
         return True
 
     async def guard_request(self, scope, receive, send, method, path):
@@ -1063,10 +1073,14 @@ def audit(db, user_id, action, target_type, target_id, detail):
 def audit_visibility_clause(actor):
     account_role = getattr(actor, "account_role", "")
     if account_role in ("administrator", "executive", "hr"):
-        return "1=1", []
-    if account_role == "store_manager" and actor.store_id:
-        return "actor_id IN (SELECT id FROM users WHERE store_id=?)", [actor.store_id]
-    return "actor_id=?", [actor.user_id]
+        clause, args = "1=1", []
+    elif account_role == "store_manager" and actor.store_id:
+        clause, args = "actor_id IN (SELECT id FROM users WHERE store_id=?)", [actor.store_id]
+    else:
+        clause, args = "actor_id=?", [actor.user_id]
+    if public_sample_mode_enabled():
+        clause += " AND object_type IN ('security','seed','user')"
+    return clause, args
 
 
 @app.get("/api/audit-events")
@@ -1315,7 +1329,7 @@ def demo_accounts(request: Request):
              "role": row["role"], "store_id": row["store_id"]}
             for row in db.execute(
                 "SELECT id,employee_code,display_name,role,store_id FROM users "
-                "WHERE account_status='ACTIVE' ORDER BY role,store_id,employee_code"
+                "WHERE account_status='ACTIVE' AND employee_code IS NOT NULL ORDER BY role,store_id,employee_code"
             )
         ]}
 
@@ -1331,9 +1345,13 @@ def demo_login(payload: DemoLoginInput, request: Request, response: Response):
         raise HTTPException(403, "デモモードは無効です")
     with connect() as db:
         user = db.execute(
-            "SELECT id,role,store_id,account_status FROM users WHERE id=?", (payload.account_id,)
+            "SELECT id,role,store_id,account_status,employee_code FROM users WHERE id=?", (payload.account_id,)
         ).fetchone()
-        if not user or user["account_status"] != "ACTIVE":
+        if not user:
+            raise HTTPException(401, "認証が必要です")
+        if user["employee_code"] is None:
+            raise HTTPException(403, "デモアカウントではありません")
+        if user["account_status"] != "ACTIVE":
             raise HTTPException(401, "認証が必要です")
         previous = request.cookies.get(SESSION_COOKIE)
         if previous:
@@ -2049,7 +2067,7 @@ def seed(db):
     ensure_system_config(db)
     ensure_demo_accounts(db)
     rental.ensure_rental_schema(db)
-    if sample_or_demo_enabled():
+    if public_sample_mode_enabled():
         rental.seed_rental(db)
 
 
@@ -3527,7 +3545,7 @@ def calendar_index(start: str, end: str, actor: CurrentActor = Depends(require_a
                 ORDER BY ce.starts_at LIMIT 300""",
             (*visibility_args, range_end, range_start),
         )]
-        task_rows = db.execute(
+        task_rows = [] if public_sample_mode_enabled() else db.execute(
             f"""SELECT t.id,t.title,t.task_type,t.due_at,t.related_type,t.related_id,
                 t.related_household_id,h.store_id,t.assignee_id,
                 COALESCE(u.display_name,u.name) AS owner_name
@@ -5044,6 +5062,7 @@ def reset_demo(request: Request, x_demo_role: CurrentActor = Depends(require_act
         try:
             with connect() as db:
                 session_token = request.cookies.get(SESSION_COOKIE)
+                db.execute("DELETE FROM system_configs WHERE config_key=?", (rental.SEED_COMPLETED_KEY,))
                 if public_sample_mode_enabled():
                     db.execute("DELETE FROM auth_sessions")
                 elif session_token:

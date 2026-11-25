@@ -245,6 +245,7 @@ def _create_table(table, columns):
 
 RENTAL_SCHEMA = "\n".join(_create_table(table, columns) for table, columns in TABLE_DEFINITIONS.items())
 RENTAL_RESET_TABLES = tuple(reversed(TABLE_DEFINITIONS))
+SEED_COMPLETED_KEY = "rental_seed_completed"
 
 
 # Reset recreates the tables at the current width and keeps schema history.
@@ -309,10 +310,19 @@ def seed_rental(db):
         """SELECT id FROM users WHERE role IN ('advisor', 'executive', 'administrator')
            ORDER BY id LIMIT 1 FOR UPDATE"""
     ).fetchone()
-    if db.execute("SELECT id FROM parties WHERE tenant_id=? LIMIT 1", (TENANT_ID,)).fetchone():
+    if db.execute(
+        "SELECT value_json FROM system_configs WHERE config_key=? FOR UPDATE", (SEED_COMPLETED_KEY,),
+    ).fetchone():
         return
     if not staff:
         raise RuntimeError("Rental sample seeding requires a baseline staff account")
+    for table in RENTAL_RESET_TABLES:
+        # Clear nullable self-references before deleting rows in foreign-key order.
+        for column, target in RELATIONSHIPS.get(table, {}).items():
+            if target == table:
+                db.execute(f"UPDATE {table} SET {column}=NULL WHERE tenant_id=? AND {column} IS NOT NULL",
+                           (TENANT_ID,))
+        db.execute(f"DELETE FROM {table} WHERE tenant_id=?", (TENANT_ID,))
     staff_id = staff["id"]
     month = datetime.now(JST).date().replace(day=1)
     history = [_month_shift(month, offset) for offset in range(-12, 0)]
@@ -550,6 +560,12 @@ def seed_rental(db):
         if inspected:
             insert("inspections", building_id=building_id, unit_id=unit_id, work_order_id=work_order_id,
                    inspection_type="REPAIR_ACCEPTANCE", inspection_date=received, inspected_by=staff_id, result="PASS")
+
+    db.execute(
+        """INSERT INTO system_configs (config_key,value_json,updated_at) VALUES (?,?,UTC_TIMESTAMP())
+           ON DUPLICATE KEY UPDATE value_json=VALUES(value_json),updated_at=VALUES(updated_at)""",
+        (SEED_COMPLETED_KEY, "1"),
+    )
 
 
 def rental_summary(db, today):
