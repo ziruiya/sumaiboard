@@ -1249,7 +1249,13 @@ function App() {
           aria-current={page === id ? "page" : undefined}
           onClick={() => { setWorkspaceView("home"); setPage(id); }}>{label}</button>)}
       </nav>}
-      <RentalPage key={`${data.user.id}:${page}`} page={page} apiBase={API_BASE}/>
+      <RentalPage
+        key={`${data.user.id}:${page}`}
+        page={page}
+        apiBase={API_BASE}
+        accountRole={data.account_role}
+        userId={data.user.id}
+      />
       {page === "households" && <Households locale={locale} items={filtered} stores={data.stores} t={t} onOpen={openHousehold} businessFilter={businessFilter} matchedTasks={matchedTasks} terminalExcludedTaskCount={terminalExcludedTaskCount} onClearBusinessFilter={() => setBusinessFilter("")} searchFeedback={searchFeedback}/>}
       {page === "introductions" && <Introductions locale={locale} items={filtered} t={t} onOpen={openHousehold}
         onAdd={(household)=>{setSelected(household);setModal("introduction");}} businessFilter={businessFilter}

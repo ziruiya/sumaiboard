@@ -1099,11 +1099,12 @@ def register_rental_routes(app, connect, require_actor, audit):
             ).fetchone()
         return row
 
-    def write(operation):
+    def write(operation, *, isolation="READ COMMITTED"):
         try:
             with connect() as db:
-                # Unit locks serialize period checks. Reads after taking a lock must see the latest commit.
-                db.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                # Ordinary writes read the latest commit after taking their locks. Close snapshots
+                # use one consistent view across all ledger and business-source queries.
+                db.execute(f"SET TRANSACTION ISOLATION LEVEL {isolation}")
                 return operation(db)
         except IntegrityError as error:
             if error.args[0] == 1062:
@@ -2439,8 +2440,25 @@ def register_rental_routes(app, connect, require_actor, audit):
             (TENANT_ID, row_id),
         ).fetchall()]
 
+    def settlement_carry_out(db, row):
+        if row["status"] != "FINALIZED" or not row["payable_amount"]:
+            return None
+        successor = db.execute(
+            """SELECT id, calculation_snapshot FROM owner_settlements
+               WHERE tenant_id=? AND management_contract_id=? AND settlement_month=?
+                 AND status='FINALIZED'""",
+            (TENANT_ID, row["management_contract_id"], _month_shift(row["settlement_month"], 1)),
+        ).fetchone()
+        if successor:
+            carry = decode(successor)["calculation_snapshot"].get("carry_in")
+            if carry and carry["settlement_id"] == row["id"]:
+                return dict(settlement_id=successor["id"], amount=carry["amount"],
+                            original_scheduled_amount=carry.get("original_scheduled_amount", row["payable_amount"]))
+        return None
+
     def settlement_detail(db, row):
         row = decode(row)
+        row["carry_out"] = settlement_carry_out(db, row)
         row["lines"] = settlement_lines(db, row["id"])
         row["remittances"] = [
             dict(decode(item), label="模擬送金") for item in db.execute(
@@ -2448,6 +2466,11 @@ def register_rental_routes(app, connect, require_actor, audit):
                 (TENANT_ID, row["id"]),
             ).fetchall()
         ]
+        for remittance in row["remittances"]:
+            remittance["carried_forward"] = bool(row["carry_out"]) and (
+                remittance["status"] in {"SCHEDULED", "FAILED"}
+                or (remittance["status"] == "CANCELLED" and remittance["failure_reason"] == "後続の精算へ繰越")
+            )
         row["contract_code"] = get(db, "management_contracts", row["management_contract_id"])["contract_code"]
         row["remittance_label"] = "模擬送金"
         return row
@@ -2493,6 +2516,35 @@ def register_rental_routes(app, connect, require_actor, audit):
                 (TENANT_ID, month, month_end(month)),
             ).fetchone()
             snapshot[name] = {key: int(value) for key, value in totals.items()}
+        snapshot["accounts"] = fund_account_balances(db, month)
+        reconciliation, independent = reconcile_business_sources(db)
+        snapshot["business_reconciliation"] = reconciliation
+        snapshot["independent_reconciliation"] = independent
+        deposits = db.execute(
+            """SELECT entry_type, COUNT(*) AS count, SUM(amount) AS amount
+               FROM fund_ledger_entries WHERE tenant_id=? AND accounting_month=?
+                 AND source_type='deposit' AND entry_type IN ('RECEIPT','REFUND')
+               GROUP BY entry_type""", (TENANT_ID, month),
+        ).fetchall()
+        deposit_totals = {row["entry_type"]: dict(count=row["count"], amount=int(row["amount"])) for row in deposits}
+        snapshot["deposit_receipts"] = deposit_totals.get("RECEIPT", dict(count=0, amount=0))
+        snapshot["deposit_refunds"] = deposit_totals.get("REFUND", dict(count=0, amount=0))
+        # Cost confirmation is stored in UTC. Month boundaries are midnight JST.
+        start, end = (datetime(day.year, day.month, 1, tzinfo=JST).astimezone(timezone.utc).replace(tzinfo=None)
+                      for day in (month, _month_shift(month, 1)))
+        repairs = db.execute(
+            """SELECT COUNT(*) AS count, COALESCE(SUM(actual_amount),0) AS amount FROM work_orders
+               WHERE tenant_id=? AND cost_confirmed_at>=? AND cost_confirmed_at<?""",
+            (TENANT_ID, start, end),
+        ).fetchone()
+        snapshot["confirmed_repairs"] = {key: int(value) for key, value in repairs.items()}
+        snapshot["remittances"] = [dict(row, result_date=str(row["result_date"])) for row in db.execute(
+            """SELECT id, settlement_id, status, scheduled_amount, actual_amount,
+                      COALESCE(remitted_date, scheduled_date) AS result_date
+               FROM owner_remittances WHERE tenant_id=?
+                 AND COALESCE(remitted_date, scheduled_date) BETWEEN ? AND ?
+               ORDER BY id""", (TENANT_ID, month, month_end(month)),
+        ).fetchall()]
         return snapshot
 
     @router.get("/periods/{month}")
@@ -2522,23 +2574,37 @@ def register_rental_routes(app, connect, require_actor, audit):
             audit(db, actor.user_id, "rental.periods.prepare", "month_close", row_id, period)
             return period_result(period, period_record(db, period))
 
-        return write(operation)
+        return write(operation, isolation="REPEATABLE READ")
 
     @router.post("/periods/{month}/close")
-    def close_rental_period(month: str, actor=Depends(require_staff)):
+    def close_rental_period(month: str, payload: dict, actor=Depends(require_staff)):
         require_role(actor, finance_roles | approval_roles)
         day = month_value(month)
         period = day.strftime("%Y-%m")
+
+        if (payload.keys() != {"id", "version"} or not isinstance(payload["id"], str) or not payload["id"]
+                or type(payload["version"]) is not int or payload["version"] < 1):
+            invalid("締め準備の id と version を指定してください")
 
         def operation(db):
             require_open_period(db, day)
             row = period_record(db, period, lock=True)
             result = period_result(period, row)
-            if result["status"] != "PREPARED" or result["snapshot"] is None:
-                invalid("賃貸月次締めを先に準備してください")
+            if (result["status"] != "PREPARED" or result["snapshot"] is None
+                    or row["id"] != payload["id"] or row["version"] != payload["version"]):
+                conflict("締め準備が更新されました。最新の準備内容を確認してください")
             if row["prepared_by"] == actor.user_id:
                 invalid("準備者とは別のユーザーが締め処理を行ってください")
-            if result["snapshot"] != rental_period_snapshot(db, day):
+            snapshot = rental_period_snapshot(db, day)
+            if any(check["difference"] for contract in snapshot["business_reconciliation"]
+                   for check in contract.values() if isinstance(check, dict)):
+                invalid("管理契約の業務データと資金台帳に照合差額があります")
+            if db.execute(
+                """SELECT id FROM owner_settlements WHERE tenant_id=? AND settlement_month=?
+                   AND status IN ('DRAFT','SUBMITTED','APPROVED') LIMIT 1""", (TENANT_ID, day),
+            ).fetchone():
+                invalid("未完了の精算があります")
+            if result["snapshot"] != snapshot:
                 conflict("集計が更新されました。月次締めを再準備してください")
             db.execute(
                 """UPDATE month_closes SET status='CLOSED',closed_by=?,closed_at=UTC_TIMESTAMP(6),
@@ -2547,7 +2613,7 @@ def register_rental_routes(app, connect, require_actor, audit):
             audit(db, actor.user_id, "rental.periods.close", "month_close", row["id"], period)
             return period_result(period, period_record(db, period))
 
-        return write(operation)
+        return write(operation, isolation="REPEATABLE READ")
 
     def settlement_peers(db, contract_id):
         return db.execute(
@@ -2955,24 +3021,19 @@ def register_rental_routes(app, connect, require_actor, audit):
                            row["approved_expenses"])
         carry = snapshot.get("carry_in")
         if carry:
-            source = decode(get(db, "owner_settlements", carry["settlement_id"], lock=True))
-            source_snapshot = source["calculation_snapshot"]
-            source_snapshot["carry_out"] = dict(original_scheduled_amount=source["payable_amount"],
-                                               amount=carry["amount"], settlement_id=row["id"])
-            update(db, actor, "owner_settlements", source, dict(closing_available_balance=0,
-                   calculation_snapshot=json.dumps(source_snapshot, ensure_ascii=False)))
-            for remit in settlement_detail(db, source)["remittances"]:
-                if remit["status"] in {"SCHEDULED", "FAILED"}:
-                    update(db, actor, "owner_remittances", remit,
-                           dict(status="CANCELLED", failure_reason="後続の精算へ繰越"))
+            source = get(db, "owner_settlements", carry["settlement_id"])
+            carry["original_scheduled_amount"] = source["payable_amount"]
             audit(db, actor.user_id, "rental.settlements.carry_forward", "owner_settlements",
-                  source["id"], str(row["id"]))
+                  source["id"], json.dumps(dict(carry, successor_settlement_id=row["id"])))
         return json.dumps(snapshot, ensure_ascii=False)
 
     def settlement_remittance(row_id, payload, actor, *, schedule=False):
         require_role(actor, finance_roles)
 
         def operation(db):
+            source = get(db, "owner_settlements", row_id)
+            if settlement_carry_out(db, source):
+                conflict("後続の精算に引き継いだ残高は、その精算で模擬送金してください")
             row, contract, operation_date = lock_settlement(db, row_id)
             options = dict(payload)
             check_version(options, row)
@@ -3048,6 +3109,8 @@ def register_rental_routes(app, connect, require_actor, audit):
             options = dict(payload)
             check_version(options, remit)
             fields("owner_remittances", options, ())
+            if settlement_carry_out(db, row):
+                conflict("後続の精算に引き継いだ残高は、その精算で模擬送金してください")
             if remit["status"] != "SCHEDULED":
                 invalid("予定の模擬送金のみ取り消せます")
             update(db, actor, "owner_remittances", remit, {"status": "CANCELLED"})
@@ -3102,19 +3165,17 @@ def register_rental_routes(app, connect, require_actor, audit):
                 raise HTTPException(404, "消込記録が見つかりません")
             return rows[0]
 
-    @router.get("/funds/summary", dependencies=[Depends(require_staff)])
-    def funds_summary():
-        with connect() as db:
-            rows = db.execute(
-                f"""SELECT f.id, f.account_code, f.account_name, f.status, e.fund_category,
-                           COALESCE(SUM({signed_entry}),0) AS balance
-                    FROM fund_accounts f LEFT JOIN fund_ledger_entries e
-                      ON e.tenant_id=f.tenant_id AND e.fund_account_id=f.id
-                    WHERE f.tenant_id=?
-                    GROUP BY f.id,f.account_code,f.account_name,f.status,e.fund_category ORDER BY f.id""",
-                (TENANT_ID,),
-            ).fetchall()
-            reconciliation, independent = reconcile_business_sources(db)
+    def fund_account_balances(db, month=None):
+        through_month = " AND e.accounting_month<=?" if month is not None else ""
+        rows = db.execute(
+            f"""SELECT f.id, f.account_code, f.account_name, f.status, e.fund_category,
+                       COALESCE(SUM({signed_entry}),0) AS balance
+                FROM fund_accounts f LEFT JOIN fund_ledger_entries e
+                  ON e.tenant_id=f.tenant_id AND e.fund_account_id=f.id{through_month}
+                WHERE f.tenant_id=?
+                GROUP BY f.id,f.account_code,f.account_name,f.status,e.fund_category ORDER BY f.id""",
+            (month, TENANT_ID) if month is not None else (TENANT_ID,),
+        ).fetchall()
         accounts = {}
         for row in rows:
             account = accounts.setdefault(row["id"], {
@@ -3124,11 +3185,18 @@ def register_rental_routes(app, connect, require_actor, audit):
             account["balance"] += balance
             if row["fund_category"] is not None:
                 account["categories"][row["fund_category"]] = balance
-        escrow = next((row for row in accounts.values() if row["account_code"] == "ESCROW"), None)
+        return list(accounts.values())
+
+    @router.get("/funds/summary", dependencies=[Depends(require_staff)])
+    def funds_summary():
+        with connect() as db:
+            accounts = fund_account_balances(db)
+            reconciliation, independent = reconcile_business_sources(db)
+        escrow = next((row for row in accounts if row["account_code"] == "ESCROW"), None)
         categories = dict.fromkeys(fund_categories, 0)
         if escrow:
             categories.update({key: value for key, value in escrow["categories"].items() if key in categories})
-        return {"accounts": list(accounts.values()), "escrow_categories": categories,
+        return {"accounts": accounts, "escrow_categories": categories,
                 "reconciliation_difference": (escrow["balance"] if escrow else 0) - sum(categories.values()),
                 "business_reconciliation": reconciliation, "independent_reconciliation": independent}
 

@@ -1070,7 +1070,8 @@ function SettlementDetails({ apiBase, id, back, openSettlement, onChange, accoun
     <RentalResult result={result}>{(row) => {
       const remitted = row.remittances.find((item) => item.status === "SIMULATED_REMITTED");
       const pending = row.remittances.find((item) => item.status === "SCHEDULED");
-      const { carry_in: carryIn, carry_out: carryOut } = row.calculation_snapshot;
+      const { carry_in: carryIn } = row.calculation_snapshot;
+      const carryOut = row.carry_out;
       return <>
         <div className="panel">
           <h2>{row.contract_code} · {row.settlement_month.slice(0, 7)}</h2>
@@ -1131,7 +1132,7 @@ function SettlementDetails({ apiBase, id, back, openSettlement, onChange, accoun
         </form>}
         <h3>模擬送金</h3>
         <MoneyList rows={row.remittances} empty="模擬送金の記録はありません。" render={(item) =>
-          <MoneyRow title={`模擬送金 · ${item.failure_reason === "後続の精算へ繰越" ? "失効（繰越）" : remittanceStatuses[item.status]}`}
+          <MoneyRow title={`模擬送金 · ${item.carried_forward ? "後続精算へ繰越" : remittanceStatuses[item.status]}`}
             description={`予定日 ${item.scheduled_date}${item.remitted_date ? ` · 実行日 ${item.remitted_date}` : ""}`}
             balance={yen.format(item.actual_amount ?? item.scheduled_amount)}/>}/>
         {canFinance && row.status === "FINALIZED" && !remitted && !carryOut && <form className="panel rental-stack" onSubmit={(event) => {
@@ -1178,7 +1179,7 @@ function RentalPeriod({ apiBase, month, accountRole, userId }) {
           </button>}
         {canClose && row.status === "PREPARED" && row.snapshot && row.prepared_by !== userId &&
           <button type="button" className="primary-btn" disabled={action.busy}
-            onClick={() => action.submit(`periods/${month}/close`, undefined, result.retry)}>締めを確定</button>}
+            onClick={() => action.submit(`periods/${month}/close`, { id: row.id, version: row.version }, result.retry)}>締めを確定</button>}
         {row.status === "PREPARED" && row.snapshot && row.prepared_by === userId && <small>別のユーザーによる確定待ち</small>}
       </div>
     </>}</RentalResult>
