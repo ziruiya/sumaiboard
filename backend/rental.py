@@ -2596,6 +2596,8 @@ def register_rental_routes(app, connect, require_actor, audit):
             if row["prepared_by"] == actor.user_id:
                 invalid("準備者とは別のユーザーが締め処理を行ってください")
             snapshot = rental_period_snapshot(db, day)
+            if any(check["difference"] for check in snapshot["independent_reconciliation"].values()):
+                invalid("未識別資金プールまたは自社資金の独立照合に差額があります")
             if any(check["difference"] for contract in snapshot["business_reconciliation"]
                    for check in contract.values() if isinstance(check, dict)):
                 invalid("管理契約の業務データと資金台帳に照合差額があります")
