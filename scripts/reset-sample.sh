@@ -10,7 +10,7 @@ BASE="${SAMPLE_BASE_URL:-http://127.0.0.1:18080}"
 LOCK_FILE="/run/lock/sumaiboard-${DEPLOYMENT_ID:-sample}.lock"
 exec 9>"$LOCK_FILE"
 flock -w 600 9 || { echo "could not acquire deployment lock" >&2; exit 1; }
-if [ -f .maintenance.flag ]; then
+if [ -f run/maintenance.flag ] || [ -f .maintenance.flag ]; then
   echo "maintenance in progress; refusing to reset" >&2
   exit 1
 fi
