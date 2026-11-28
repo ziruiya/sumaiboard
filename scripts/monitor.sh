@@ -121,8 +121,28 @@ if success:
             recovered("backup-stale", "backup")
     except Exception:
         pass
-    if success.get("offsite") == "failed":
-        problems.append(("backup-offsite", "backup", "warning", "offsite copy failed"))
+    # M-03-R2: distinguish pending / published / failed. The authoritative
+    # publication state comes from status/offsite-published.json, written
+    # by the VM pull+publish confirmation; last-success only records the
+    # state known at backup time.
+    pub = load_json(os.path.join(status_dir, "offsite-published.json")) or {}
+    bid = success.get("backup_id", "")
+    offsite_state = pub.get(bid) or success.get("offsite")
+    if offsite_state == "failed":
+        problems.append(("backup-offsite", "backup", "warning", "offsite publish failed"))
+    elif offsite_state == "pending":
+        try:
+            done = time.mktime(time.strptime(success["completed_at"][:19], "%Y-%m-%dT%H:%M:%S"))
+            if now - done > 2 * 3600:
+                problems.append(("backup-offsite-pending", "backup", "warning", "offsite publication unconfirmed >2h"))
+            else:
+                recovered("backup-offsite-pending", "backup")
+        except Exception:
+            pass
+        recovered("backup-offsite", "backup")
+    elif offsite_state == "published":
+        recovered("backup-offsite", "backup")
+        recovered("backup-offsite-pending", "backup")
     else:
         recovered("backup-offsite", "backup")
 if attempt and attempt.get("offsite") == "failed":

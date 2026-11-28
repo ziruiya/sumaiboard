@@ -6,7 +6,10 @@ The plaintext payload is: 8-byte big-endian manifest length + manifest bytes +
 archive bytes. The payload is split into 4 MiB chunks; every chunk's Fernet
 plaintext internally binds backup_id, archive name, chunk index and total
 chunk count, so chunks cannot be mixed across generations, replaced or
-reordered. Memory use is bounded (<64 MiB) regardless of archive size.
+reordered. Memory use is bounded (<64 MiB) regardless of archive size:
+encryption streams chunk by chunk and decryption (M-03-R1) authenticates
+and writes chunk by chunk to temp files, atomically publishing the result
+only after every chunk, the total length and the exact EOF are verified.
 """
 import argparse
 import base64
@@ -89,42 +92,95 @@ def _write_chunk(out, fernet, backup_id, archive, index, total, data):
 
 def decrypt(enc_path: str, out_archive: str, out_manifest: str,
             passphrase_file: str, expect_backup_id: str = "") -> dict:
+    """Streaming decrypt (M-03-R1).
+
+    Authenticates and writes chunk by chunk. Peak memory is bounded by one
+    chunk plus the (size-capped) manifest; the archive is never accumulated
+    in memory. Token length, manifest length and chunk count are validated
+    before data is trusted. Results are written to temp files in the
+    destination directory and atomically renamed only after every chunk,
+    the total payload length and the exact end-of-file position verify;
+    any failure removes the temp outputs.
+    """
+    MAX_TOKEN = CHUNK * 2
+    MAX_MANIFEST = 16 * 1024 * 1024
+    MAX_CHUNKS = 100000
     passphrase = read_passphrase(passphrase_file)
-    with open(enc_path, "rb") as fh:
-        header = json.loads(fh.readline().decode("utf-8"))
-        if header.get("format") != "sumaiboard-backup-crypto-v1":
-            raise SystemExit("unknown backup crypto format")
-        fernet = Fernet(derive_key(passphrase, base64.b64decode(header["salt_b64"])))
-        total = int(header["chunks"])
-        if expect_backup_id and header["backup_id"] != expect_backup_id:
-            raise SystemExit("backup_id mismatch in header")
-        payload = bytearray()
-        for index in range(total):
-            raw_len = fh.read(8)
-            if len(raw_len) != 8:
-                raise SystemExit(f"truncated chunk header at {index}")
-            (token_len,) = struct.unpack(">Q", raw_len)
-            token = fh.read(token_len)
-            if len(token) != token_len:
-                raise SystemExit(f"truncated chunk at {index}")
+    out_dir = os.path.dirname(os.path.abspath(out_archive)) or "."
+    tmp_archive = os.path.join(out_dir, ".dec-archive.tmp")
+    tmp_manifest = os.path.join(out_dir, ".dec-manifest.tmp")
+    try:
+        with open(enc_path, "rb") as fh:
+            header = json.loads(fh.readline().decode("utf-8"))
+            if header.get("format") != "sumaiboard-backup-crypto-v1":
+                raise SystemExit("unknown backup crypto format")
+            if int(header.get("chunk_size", 0)) != CHUNK:
+                raise SystemExit("unexpected chunk_size in header")
+            total = int(header["chunks"])
+            if total < 1 or total > MAX_CHUNKS:
+                raise SystemExit("chunk count out of bounds")
+            fernet = Fernet(derive_key(passphrase, base64.b64decode(header["salt_b64"])))
+            if expect_backup_id and header["backup_id"] != expect_backup_id:
+                raise SystemExit("backup_id mismatch in header")
+            manifest_len = None
+            manifest_buf = bytearray()
+            prefix_buf = bytearray()
+            archive_bytes = 0
+            with open(tmp_archive, "wb") as archive_out:
+                for index in range(total):
+                    raw_len = fh.read(8)
+                    if len(raw_len) != 8:
+                        raise SystemExit(f"truncated chunk header at {index}")
+                    (token_len,) = struct.unpack(">Q", raw_len)
+                    if token_len < 1 or token_len > MAX_TOKEN:
+                        raise SystemExit(f"chunk {index} token length out of bounds")
+                    token = fh.read(token_len)
+                    if len(token) != token_len:
+                        raise SystemExit(f"truncated chunk at {index}")
+                    try:
+                        plain = fernet.decrypt(token)
+                    except InvalidToken:
+                        raise SystemExit(f"chunk {index} authentication failed")
+                    binding_line, _, data = plain.partition(b"\n")
+                    binding = json.loads(binding_line.decode("utf-8"))
+                    if (binding["backup_id"] != header["backup_id"]
+                            or binding["archive"] != header["archive"]
+                            or binding["index"] != index or binding["total"] != total):
+                        raise SystemExit(f"chunk {index} binding mismatch")
+                    view = data
+                    if manifest_len is None:
+                        prefix_buf += view
+                        if len(prefix_buf) < 8:
+                            continue
+                        (manifest_len,) = struct.unpack(">Q", bytes(prefix_buf[:8]))
+                        if manifest_len < 0 or manifest_len > MAX_MANIFEST:
+                            raise SystemExit("manifest length out of bounds")
+                        view = bytes(prefix_buf[8:])
+                        prefix_buf = bytearray()
+                    if manifest_len is not None and len(manifest_buf) < manifest_len:
+                        take = min(manifest_len - len(manifest_buf), len(view))
+                        manifest_buf += view[:take]
+                        view = view[take:]
+                    if view:
+                        archive_out.write(view)
+                        archive_bytes += len(view)
+                if fh.read(1):
+                    raise SystemExit("trailing data after final chunk")
+            if manifest_len is None or len(manifest_buf) != manifest_len:
+                raise SystemExit("payload shorter than declared manifest")
+            if archive_bytes <= 0:
+                raise SystemExit("empty archive payload")
+        with open(tmp_manifest, "wb") as fh:
+            fh.write(bytes(manifest_buf))
+        os.replace(tmp_manifest, out_manifest)
+        os.replace(tmp_archive, out_archive)
+    except BaseException:
+        for p in (tmp_archive, tmp_manifest):
             try:
-                plain = fernet.decrypt(token)
-            except InvalidToken:
-                raise SystemExit(f"chunk {index} authentication failed")
-            binding_line, _, data = plain.partition(b"\n")
-            binding = json.loads(binding_line.decode("utf-8"))
-            if (binding["backup_id"] != header["backup_id"]
-                    or binding["archive"] != header["archive"]
-                    or binding["index"] != index or binding["total"] != total):
-                raise SystemExit(f"chunk {index} binding mismatch")
-            payload += data
-    (manifest_len,) = struct.unpack(">Q", bytes(payload[:8]))
-    manifest = bytes(payload[8:8 + manifest_len])
-    archive = bytes(payload[8 + manifest_len:])
-    with open(out_manifest, "wb") as fh:
-        fh.write(manifest)
-    with open(out_archive, "wb") as fh:
-        fh.write(archive)
+                os.unlink(p)
+            except OSError:
+                pass
+        raise
     return header
 
 

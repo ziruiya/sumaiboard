@@ -7,7 +7,9 @@ services:
       mysql:
         condition: service_healthy
     ports:
-      - "127.0.0.1:8000:8000"
+      # Aligned with the live sample deployment (locally fixed to 18080 so
+      # the public route stays stable); deploys must not flip this back.
+      - "127.0.0.1:18080:8000"
     healthcheck:
       test:
         - CMD
@@ -38,17 +40,27 @@ services:
       INITIAL_ADMIN_EMPLOYEE_CODE: ${INITIAL_ADMIN_EMPLOYEE_CODE:-}
       INITIAL_ADMIN_NAME: ${INITIAL_ADMIN_NAME:-}
       INITIAL_ADMIN_PASSWORD_FILE: ${INITIAL_ADMIN_PASSWORD_FILE:-}
-      ATTACHMENT_STORAGE_DIR: ${ATTACHMENT_STORAGE_DIR:-}
-      BACKUP_DIR: ${BACKUP_DIR:-}
+      ATTACHMENT_STORAGE_DIR: /app/attachments
+      BACKUP_DIR: /app/backups
       OPS_STATUS_TOKEN: ${OPS_STATUS_TOKEN:-}
       BUILD_REVISION: ${BUILD_REVISION:-}
       APP_VERSION: ${APP_VERSION:-3.1.0}
-      MAINTENANCE_FLAG_FILE: ${MAINTENANCE_FLAG_FILE:-/app/run/maintenance.flag}
-      BACKUP_STATUS_FILE: ${BACKUP_STATUS_FILE:-}
+      MAINTENANCE_FLAG_FILE: /app/run/maintenance.flag
+      BACKUP_STATUS_FILE: /app/backups/status/last-success.json
       LEGACY_MIGRATION_AUTHORIZED: ${LEGACY_MIGRATION_AUTHORIZED:-}
       MONITOR_WEBHOOK_URL: ${MONITOR_WEBHOOK_URL:-}
     volumes:
       - referral-documents:/app/private_storage/referral-documents
+      # M-09 persistent wiring: the env paths above only work because these
+      # host bind mounts exist. The deployment directory itself is mounted
+      # at /deploy so the app reads the SAME maintenance flag file that
+      # deploy.sh/backup.sh write on the host ($TARGET/.maintenance.flag),
+      # the backup status directory written by backup.sh, the attachment
+      # root and the initial-admin password file directory.
+      - ./run:/app/run
+      - ./attachments:/app/attachments
+      - ./backups:/app/backups
+      - ./secrets:/app/secrets:ro
 
   mysql:
     image: mysql:8.0

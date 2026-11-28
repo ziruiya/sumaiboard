@@ -10,8 +10,8 @@ services:
     build: .
     container_name: sumaiboard-app${VERIFY_SUFFIX:--verify}
     restart: "no"
-    cpus: 0.5
-    mem_limit: 1g
+    cpus: 0.25
+    mem_limit: 512m
     depends_on:
       mysql:
         condition: service_healthy
@@ -43,7 +43,7 @@ services:
       BUILD_REVISION: ${BUILD_REVISION:-}
       APP_VERSION: ${APP_VERSION:-3.1.0}
       MAINTENANCE_FLAG_FILE: ${MAINTENANCE_FLAG_FILE:-/app/run/maintenance.flag}
-      BACKUP_STATUS_FILE: ${BACKUP_STATUS_FILE:-}
+      BACKUP_STATUS_FILE: ${BACKUP_STATUS_FILE:-/app/backups/status/last-success.json}
       LEGACY_MIGRATION_AUTHORIZED: ${LEGACY_MIGRATION_AUTHORIZED:-}
       MONITOR_WEBHOOK_URL: ${MONITOR_WEBHOOK_URL:-}
     volumes:
@@ -55,8 +55,8 @@ services:
     image: mysql:8.0
     container_name: sumaiboard-mysql${VERIFY_SUFFIX:--verify}
     restart: "no"
-    cpus: 0.5
-    mem_limit: 1g
+    cpus: 0.25
+    mem_limit: 512m
     environment:
       MYSQL_DATABASE: ${VERIFY_DB_NAME:-sb_verify}
       MYSQL_USER: ${VERIFY_DB_USER:-sb_verify}
