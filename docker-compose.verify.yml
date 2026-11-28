@@ -1,0 +1,85 @@
+# Verification / restore-only stack (spec 7.3, Q01 scheme B).
+# Used ONLY for product verification (standing stack, suffix -verify,
+# port 18099) and restore drills (suffix -restore, port 18190). Never used
+# for the running deployment; container/volume/network names are suffixed
+# so nothing collides with the live stack (mallboard-app / mallboard-mysql).
+name: ${VERIFY_PROJECT:-sumaiboard-verify}
+
+services:
+  app:
+    build: .
+    container_name: sumaiboard-app${VERIFY_SUFFIX:--verify}
+    restart: "no"
+    cpus: 0.5
+    mem_limit: 1g
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${VERIFY_PORT:-18099}:8000"
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: ${VERIFY_DB_NAME:-sb_verify}
+      DB_USER: ${VERIFY_DB_USER:-sb_verify}
+      DB_PASSWORD: ${VERIFY_DB_PASSWORD:-sb_verify_pw}
+      DEMO_MODE: ${DEMO_MODE:-false}
+      PUBLIC_SAMPLE_MODE: ${PUBLIC_SAMPLE_MODE:-false}
+      SAMPLE_RESET_TOKEN: ${SAMPLE_RESET_TOKEN:-}
+      SAMPLE_GUEST_EMPLOYEE_CODE: ${SAMPLE_GUEST_EMPLOYEE_CODE:-EX-01}
+      REFERRAL_STORAGE_DIR: /app/private_storage/referral-documents
+      DEPLOYMENT_PROFILE: ${DEPLOYMENT_PROFILE:-product}
+      DEPLOYMENT_ID: ${DEPLOYMENT_ID:-verify-deployment}
+      DEPLOYMENT_TENANT_ID: ${DEPLOYMENT_TENANT_ID:-1}
+      DEPLOYMENT_NAME: ${DEPLOYMENT_NAME:-}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-http://127.0.0.1:18099}
+      MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY:-}
+      INITIAL_ADMIN_EMPLOYEE_CODE: ${INITIAL_ADMIN_EMPLOYEE_CODE:-}
+      INITIAL_ADMIN_NAME: ${INITIAL_ADMIN_NAME:-}
+      INITIAL_ADMIN_PASSWORD_FILE: ${INITIAL_ADMIN_PASSWORD_FILE:-}
+      ATTACHMENT_STORAGE_DIR: ${ATTACHMENT_STORAGE_DIR:-/app/attachments}
+      BACKUP_DIR: ${BACKUP_DIR:-/app/backups}
+      OPS_STATUS_TOKEN: ${OPS_STATUS_TOKEN:-}
+      BUILD_REVISION: ${BUILD_REVISION:-}
+      APP_VERSION: ${APP_VERSION:-3.1.0}
+      MAINTENANCE_FLAG_FILE: ${MAINTENANCE_FLAG_FILE:-/app/run/maintenance.flag}
+      BACKUP_STATUS_FILE: ${BACKUP_STATUS_FILE:-}
+      LEGACY_MIGRATION_AUTHORIZED: ${LEGACY_MIGRATION_AUTHORIZED:-}
+      MONITOR_WEBHOOK_URL: ${MONITOR_WEBHOOK_URL:-}
+    volumes:
+      - verify-docs${VERIFY_SUFFIX:--verify}:/app/private_storage/referral-documents
+      - verify-attach${VERIFY_SUFFIX:--verify}:/app/attachments
+      - verify-backup${VERIFY_SUFFIX:--verify}:/app/backups
+
+  mysql:
+    image: mysql:8.0
+    container_name: sumaiboard-mysql${VERIFY_SUFFIX:--verify}
+    restart: "no"
+    cpus: 0.5
+    mem_limit: 1g
+    environment:
+      MYSQL_DATABASE: ${VERIFY_DB_NAME:-sb_verify}
+      MYSQL_USER: ${VERIFY_DB_USER:-sb_verify}
+      MYSQL_PASSWORD: ${VERIFY_DB_PASSWORD:-sb_verify_pw}
+      MYSQL_ROOT_PASSWORD: ${VERIFY_MYSQL_ROOT_PASSWORD:-sb_verify_root_pw}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    volumes:
+      - verify-mysql${VERIFY_SUFFIX:--verify}:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+volumes:
+  verify-mysql-verify:
+  verify-docs-verify:
+  verify-attach-verify:
+  verify-backup-verify:
+  verify-mysql-restore:
+  verify-docs-restore:
+  verify-attach-restore:
+  verify-backup-restore:

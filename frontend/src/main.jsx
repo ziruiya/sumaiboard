@@ -7,6 +7,7 @@ import {
   Users, WalletCards, X,
 } from "lucide-react";
 import "./style.css";
+import { apiFetch } from "./api.js";
 import CollaborationWorkspace from "./collaboration.jsx";
 import RentalPage, { rentalPages } from "./rental.jsx";
 import { todayJst } from "./jst-date.js";
@@ -308,7 +309,7 @@ const COPY = {
     queueRisk: "リスク", riskNone: "通常", riskWatch: "要確認", riskHigh: "優先",
     saveQueueAction: "行動を保存", noNegotiations: "対応対象の商談はありません。",
     systemManagement: "\u30b7\u30b9\u30c6\u30e0\u7ba1\u7406", descHouseholds: "\u9867\u5ba2\u30fb\u4e16\u5e2f\u306e\u4e00\u89a7\u3001\u8a73\u7d30\u3001\u5c65\u6b74", descIntroductions: "\u7d39\u4ecb\u3068\u5546\u8ac7\u306e\u9032\u6357\u7ba1\u7406", descRevenue: "\u7740\u5de5\u78ba\u8a8d\u3068\u5831\u916c\u306e\u51e6\u7406\u72b6\u6cc1", descTeam: "\u5168\u54e1\u306e\u65e5\u7a0b\u3001\u63b2\u793a\u677f\u3001\u5546\u8ac7\u30ad\u30e5\u30fc", descManagement: "\u7d4c\u55b6\u6307\u6a19\u3068\u5e97\u8217\u904b\u55b6\u306e\u72b6\u6cc1", descSettings: "\u8868\u793a\u3001\u901a\u77e5\u3001\u696d\u52d9\u306e\u8a2d\u5b9a", descAccounts: "\u30a2\u30ab\u30a6\u30f3\u30c8\u3068\u6a29\u9650\u306e\u7ba1\u7406",
-    copyright: "© 2026 SUZIRUI · V3.0.2",
+    copyright: "© 2026 SUZIRUI · V3.1.0",
   },
   zh: {
     summaryOriginal: "原文",
@@ -601,7 +602,7 @@ const COPY = {
     queueAction: "下一步行动", queueOwner: "负责人", queueStage: "洽谈阶段",
     queueRisk: "风险", riskNone: "正常", riskWatch: "需关注", riskHigh: "优先",
     saveQueueAction: "保存行动", noNegotiations: "暂无待处理洽谈。",
-    copyright: "© 2026 SUZIRUI · V3.0.2",
+    copyright: "© 2026 SUZIRUI · V3.1.0",
   },
 };
 
@@ -778,6 +779,9 @@ function App() {
   const [demoAccounts, setDemoAccounts] = useState([]);
   const [demoAvailable, setDemoAvailable] = useState(false);
   const [sampleMode, setSampleMode] = useState(false);
+  const [mfaChallenge, setMfaChallenge] = useState("");
+  const [needsGrant, setNeedsGrant] = useState(false);
+  const [publicConfig, setPublicConfig] = useState(null);
   const [loginError, setLoginError] = useState("");
   const [notifications, setNotifications] = useState([]);
   const [notificationUnreadCount, setNotificationUnreadCount] = useState(0);
@@ -810,7 +814,7 @@ function App() {
 
   async function refreshNotifications() {
     const requestId = ++notificationRequestId.current;
-    const response = await fetch(`${API_BASE}/api/notifications`, { credentials: "include" });
+    const response = await apiFetch(`${API_BASE}/api/notifications`, { credentials: "include" });
     if (!response.ok) return;
     const result = await response.json();
     if (requestId !== notificationRequestId.current) return;
@@ -819,7 +823,7 @@ function App() {
   }
 
   async function load() {
-    const identityResponse = await fetch(`${API_BASE}/api/bootstrap`, { credentials: "include" });
+    const identityResponse = await apiFetch(`${API_BASE}/api/bootstrap`, { credentials: "include" });
     if (!identityResponse.ok) throw new Error("session expired");
     const identity = await identityResponse.json();
     setRole(identity.role);
@@ -834,9 +838,19 @@ function App() {
       setAuthenticated(true);
       return identity;
     }
+    if (identity.user.auth_stage === "MFA_ENROLLMENT_REQUIRED") {
+      notificationRequestId.current += 1;
+      setData(identity);
+      setTasks([]);
+      setNotifications([]);
+      setNotificationUnreadCount(0);
+      setPage("mfa-enrollment");
+      setAuthenticated(true);
+      return identity;
+    }
     const result = { ...identity, households: [] };
     if (["hr", "administrator"].includes(identity.account_role)) {
-      const accountsResponse = await fetch(`${API_BASE}/api/accounts`, { credentials: "include" });
+      const accountsResponse = await apiFetch(`${API_BASE}/api/accounts`, { credentials: "include" });
       if (!accountsResponse.ok) throw new Error("account access denied");
       Object.assign(result, await accountsResponse.json());
     }
@@ -844,7 +858,7 @@ function App() {
     else if (identity.account_role === "owner") setPage("owner-portal");
     else if (identity.environment?.public_sample) setPreferences(identity.preferences);
     else {
-      const preferencesResponse = await fetch(`${API_BASE}/api/preferences`, { credentials: "include" });
+      const preferencesResponse = await apiFetch(`${API_BASE}/api/preferences`, { credentials: "include" });
       if (!preferencesResponse.ok) throw new Error("preferences access denied");
       setPreferences(await preferencesResponse.json());
     }
@@ -863,9 +877,9 @@ function App() {
     if (window.matchMedia("(max-width: 1023px)").matches) window.scrollTo(0, 0);
   }, [page, workspaceView]);
   useEffect(() => {
-    fetch(`${API_BASE}/api/public-config`)
+    apiFetch(`${API_BASE}/api/public-config`)
       .then(async (response) => (response.ok ? response.json() : null))
-      .then((config) => { if (config?.public_sample) setSampleMode(true); })
+      .then((config) => { setPublicConfig(config); if (config?.public_sample) setSampleMode(true); })
       .catch(() => {});
   }, []);
   useEffect(() => {
@@ -874,10 +888,10 @@ function App() {
         await load();
       } catch {
         try {
-          const configResponse = await fetch(`${API_BASE}/api/public-config`);
+          const configResponse = await apiFetch(`${API_BASE}/api/public-config`);
           const config = configResponse.ok ? await configResponse.json() : null;
           if (config?.public_sample) {
-            const guestResponse = await fetch(`${API_BASE}/api/auth/guest-login`, {
+            const guestResponse = await apiFetch(`${API_BASE}/api/auth/guest-login`, {
               method: "POST", credentials: "include",
             });
             if (guestResponse.ok) await load();
@@ -885,7 +899,7 @@ function App() {
         } catch { /* stay on the login page */ }
       }
     })();
-    fetch(`${API_BASE}/api/auth/demo-accounts`, { credentials: "include" })
+    apiFetch(`${API_BASE}/api/auth/demo-accounts`, { credentials: "include" })
       .then(async (response) => {
         if (!response.ok) return;
         const result = await response.json();
@@ -915,7 +929,7 @@ function App() {
     setSearchActiveIndex(-1);
     const timer = setTimeout(async () => {
       try {
-        const response = await fetch(`${API_BASE}/api/households/search?q=${encodeURIComponent(term)}`, {
+        const response = await apiFetch(`${API_BASE}/api/households/search?q=${encodeURIComponent(term)}`, {
           credentials: "include",
         });
         if (!response.ok) throw new Error("search failed");
@@ -983,7 +997,7 @@ function App() {
   async function api(path, method = "POST", body) {
     setBusy(true);
     try {
-      const response = await fetch(`${API_BASE}${path}`, {
+      const response = await apiFetch(`${API_BASE}${path}`, {
         method, credentials: "include", headers: { "Content-Type": "application/json" },
         body: body ? JSON.stringify(body) : undefined,
       });
@@ -1007,15 +1021,42 @@ function App() {
     setBusy(true);
     setLoginError("");
     try {
-      const response = await fetch(`${API_BASE}${path}`, {
+      const response = await apiFetch(`${API_BASE}${path}`, {
         method: "POST", credentials: "include",
         headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.detail || t("error"));
+      if (payload.mfa_required && payload.challenge) {
+        setMfaChallenge(payload.challenge);
+        return;
+      }
       const identity = await load();
       setBusinessFilter("");
       if (!identity.user.must_change_password && identity.account_role !== "hr") {
+        setPage(identity.account_role === "owner" ? "owner-portal" : "dashboard");
+      }
+    } catch (error) {
+      if ((error.message || "").includes("グラント")) setNeedsGrant(true);
+      setLoginError(error.message || t("error"));
+    } finally { setBusy(false); }
+  }
+
+  async function verifyMfa(code) {
+    setBusy(true);
+    setLoginError("");
+    try {
+      const response = await apiFetch(`${API_BASE}/api/auth/mfa/verify`, {
+        method: "POST", credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ challenge: mfaChallenge, code }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.detail || t("error"));
+      setMfaChallenge("");
+      const identity = await load();
+      if (!identity.user.must_change_password && identity.user.auth_stage !== "MFA_ENROLLMENT_REQUIRED"
+          && identity.account_role !== "hr") {
         setPage(identity.account_role === "owner" ? "owner-portal" : "dashboard");
       }
     } catch (error) {
@@ -1027,7 +1068,7 @@ function App() {
     resetSearchState();
     setSearchExpanded(false);
     setAccountMenuOpen(false);
-    await fetch(`${API_BASE}/api/auth/logout`, { method: "POST", credentials: "include" });
+    await apiFetch(`${API_BASE}/api/auth/logout`, { method: "POST", credentials: "include" });
     setAuthenticated(false);
     setData(null);
     setTasks([]);
@@ -1048,7 +1089,7 @@ function App() {
     setSearchActiveIndex(-1);
   }
   async function updateNotification(notification, action) {
-    const response = await fetch(`${API_BASE}/api/notifications/${notification.id}/${action}`, {
+    const response = await apiFetch(`${API_BASE}/api/notifications/${notification.id}/${action}`, {
       method: "PUT", credentials: "include",
     });
     if (!response.ok) throw new Error(t("error"));
@@ -1152,7 +1193,15 @@ function App() {
     if (household) setIntroFocusHouseholdId(household.id);
   }
   if (!authenticated || !data) return <>{sampleMode && <SampleWatermark />}<LoginPage locale={locale} setLocale={setLocale} t={t} accounts={demoAccounts}
-    demoAvailable={demoAvailable} error={loginError} busy={busy} onLogin={login}/></>;
+    demoAvailable={demoAvailable} error={loginError} busy={busy} onLogin={login}
+    mfaChallenge={mfaChallenge} onMfaVerify={verifyMfa} needsGrant={needsGrant}
+    brandName={publicConfig?.profile === "product" ? publicConfig.company_name : null}
+    productBrand={publicConfig?.profile === "product"}/></>;
+  if (page === "mfa-enrollment") return <MfaEnrollmentPage api={api} t={t} onDone={async () => {
+    const identity = await load().catch(() => null);
+    if (identity && !identity.user.must_change_password && identity.user.auth_stage !== "MFA_ENROLLMENT_REQUIRED")
+      setPage(identity.account_role === "hr" ? "accounts" : "dashboard");
+  }}/>;
   const navItems = data.account_role === "owner" ? rentalPages.slice(-1)
     : data.account_role === "hr" ? [["accounts", t("accounts")]]
       : [...rentalPages.filter(([id]) => id !== "owner-portal"), ["team", t("collaboration")], ["management", t("management")],
@@ -1243,7 +1292,11 @@ function App() {
       <div className="account-menu-wrap" ref={accountMenuRef}><button type="button" className="account-menu-button" aria-label={t("account")} aria-expanded={accountMenuOpen} onClick={() => setAccountMenuOpen((v)=>!v)}><span className="avatar">{role === "hq_finance" ? "\u7d4c" : role === "manager" ? "\u5e97" : "\u4f50"}</span><span className="role-meta"><b>{data.user?.name || "\u2014"}</b><small>{roleLabel(locale, data.account_role || role)}</small></span><ChevronDown size={16}/></button>{accountMenuOpen && <div className="account-menu-panel"><div className="account-menu-identity"><b>{data.user?.name || "\u2014"}</b><span>{roleLabel(locale, data.account_role || role)}</span></div>{demoAvailable && <div className="select-wrap"><Users size={15}/><select aria-label={t("account")} value={data.user.id} onChange={(event) => login("/api/auth/demo-login", { account_id: Number(event.target.value) })}>{demoAccounts.map((option) => <option value={option.id} key={option.id}>{option.display_name} · {roleLabel(locale, option.role)}{option.store_id ? ` \u00b7 ${option.store_id}` : ""}</option>)}</select><ChevronDown size={13}/></div>}<button className="language-btn" onClick={() => setLocale(locale === "ja" ? "zh" : "ja")} title={t("language")}><Languages size={16}/>{locale === "ja" ? "\u4e2d\u6587" : "\u65e5\u672c\u8a9e"}</button><button className="account-signout" onClick={logout}><LogOut size={16}/>{sampleMode ? "管理者ログイン" : t("signOut")}</button></div>}</div></div>
     </header><main className="page-main"><div className="page-content">{!data ? <div className="loading"><div className="spinner"/>Loading SumaiBoard\u2026</div> : <>
       {page === "accounts" && ["hr","administrator"].includes(data.account_role) && <AccountsPage accounts={data.accounts || []} locale={locale} t={t} api={api}/>}
-      {page === "change-password" && <PasswordChangePage forced api={api} t={t} onChanged={() => setPage(data.account_role === "hr" ? "accounts" : "dashboard")}/>}
+      {page === "change-password" && <PasswordChangePage forced api={api} t={t} onChanged={async () => {
+        const identity = await load().catch(() => null);
+        if (identity && !identity.user.must_change_password && identity.user.auth_stage !== "MFA_ENROLLMENT_REQUIRED")
+          setPage(identity.account_role === "hr" ? "accounts" : "dashboard");
+      }}/>}
       {page !== "change-password" && <nav className="rental-nav" aria-label="業務メニュー">
         {navItems.map(([id, label]) => <button className="secondary-btn" type="button" key={id}
           aria-current={page === id ? "page" : undefined}
@@ -1270,7 +1323,7 @@ function App() {
         <AuditTrailPanel t={t} userId={data.user.id} locale={locale}/>
         {!sampleMode && <MonthClosePanel accountRole={data.account_role} userId={data.user.id} t={t}/>}
       </div>}
-      {page === "settings" && <SettingsPage data={data} t={t} role={role} locale={locale} onLocaleChange={setLocale} onReset={async()=>{if(window.confirm(t("resetConfirm"))){await api("/api/reset");setToast(t("resetDone"));}}} onConfigSaved={()=>{load().catch(()=>setToast("API connection failed"));setToast(t("configSaved"));}} preferences={preferences} onSavePreferences={(next)=>api("/api/preferences","PUT",next)} sampleMode={sampleMode}/>}
+      {page === "settings" && <SettingsPage data={data} t={t} role={role} locale={locale} onLocaleChange={setLocale} onReset={async()=>{if(window.confirm(t("resetConfirm"))){await api("/api/reset");setToast(t("resetDone"));}}} onConfigSaved={()=>{load().catch(()=>setToast("API connection failed"));setToast(t("configSaved"));}} preferences={preferences} onSavePreferences={(next)=>api("/api/preferences","PUT",next)} sampleMode={sampleMode} api={api}/>}
     </>}<footer className="app-footer"><ShieldCheck size={14}/>{t("prototype")} ? {t("demoWarning")}<span>{t("copyright")}</span></footer></div></main>
     {modal === "household" && selected && <HouseholdModal locale={locale} household={selected} t={t} role={role}
       onClose={() => setModal("")} onActivity={() => setModal("activity")} api={api}/>}
@@ -1321,13 +1374,238 @@ function NotificationCenter({ items, unreadCount, locale, t, onOpen, onRead, onA
   </section>;
 }
 
+
+function MfaEnrollmentPage({ api, t, onDone }) {
+  const [setup, setSetup] = useState(null);
+  const [code, setCode] = useState("");
+  const [codes, setCodes] = useState(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    (async () => {
+      try { setSetup(await api("/api/auth/mfa/setup", "POST", {})); }
+      catch (e) { setError(e.message || "MFA設定を開始できませんでした"); }
+    })();
+  }, []);
+  async function confirm(event) {
+    event.preventDefault();
+    setBusy(true); setError("");
+    try {
+      const result = await api("/api/auth/mfa/confirm", "POST",
+        { enrollment_token: setup.enrollment_token, code });
+      if (result.recovery_codes) { setCodes(result.recovery_codes); return; }
+      await onDone();
+    } catch (e) { setError(e.message || t("error")); }
+    finally { setBusy(false); }
+  }
+  if (codes) return <main className="login-shell"><section className="login-card">
+    <h1>回復コードを保存してください</h1>
+    <p>各コードは1回だけ使えます。安全な場所に保管してください（この画面を閉じると再表示できません）。</p>
+    <div className="recovery-codes">{codes.map((c) => <code key={c}>{c}</code>)}</div>
+    {error && <div className="config-error" role="alert">{error}</div>}
+    <button className="primary-btn" onClick={() => onDone()}>保存したので進む</button>
+  </section></main>;
+  return <main className="login-shell"><section className="login-card">
+    <p className="eyebrow">SumaiBoard</p><h1>二要素認証の設定が必要です</h1>
+    <p>認証アプリ（Google Authenticator / FreeOTP 等）に以下のシークレットを登録し、表示される6桁コードを入力してください。</p>
+    {setup ? <>
+      <label>シークレット（手入力用）<input readOnly value={setup.secret} onFocus={(e) => e.target.select()} /></label>
+      <p><small>otpauth URI: {setup.otpauth_uri}</small></p>
+      <form onSubmit={confirm}>
+        <label>認証コード<input inputMode="numeric" autoComplete="one-time-code" value={code}
+          onChange={(e) => setCode(e.target.value)} required /></label>
+        <button className="primary-btn login-submit" disabled={busy || !code}>確認して有効化</button>
+      </form>
+    </> : <p>設定を準備しています…</p>}
+    {error && <div className="config-error" role="alert">{error}</div>}
+  </section></main>;
+}
+
+function MfaSettingsPanel({ api, t, accountRole }) {
+  const [status, setStatus] = useState(null);
+  const [setup, setSetup] = useState(null);
+  const [code, setCode] = useState("");
+  const [codes, setCodes] = useState(null);
+  const [password, setPassword] = useState("");
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [resetUserId, setResetUserId] = useState("");
+  const [resetReason, setResetReason] = useState("");
+  const [grant, setGrant] = useState("");
+  const isExecutive = ["administrator", "executive"].includes(accountRole);
+  async function reload() {
+    try { setStatus(await api("/api/auth/mfa/status", "GET")); } catch { setStatus(null); }
+  }
+  useEffect(() => { reload(); }, []);
+  async function act(fn) {
+    setError(""); setMessage("");
+    try { await fn(); } catch (e) { setError(e.message || t("error")); }
+  }
+  if (!status) return null;
+  return <section className="panel config-panel"><div className="panel-head"><div>
+    <div className="eyebrow">MFA</div><h2>二要素認証（TOTP）</h2></div><ShieldCheck size={17} className="green-text" /></div>
+    <p>状態：{status.totp_enabled ? "有効" : "未設定"}{status.mandatory ? "（このロールでは必須）" : ""}
+      {status.mfa_reset_pending ? " / リセット待ち（次回ログイン時に回復認可が必要）" : ""}</p>
+    {!status.totp_enabled && !setup && <button className="secondary-btn" onClick={() => act(async () => {
+      setSetup(await api("/api/auth/mfa/setup", "POST", {})); })}>認証器を設定する</button>}
+    {setup && <div>
+      <label>シークレット<input readOnly value={setup.secret} onFocus={(e) => e.target.select()} /></label>
+      <label>認証コード<input inputMode="numeric" value={code} onChange={(e) => setCode(e.target.value)} /></label>
+      <button className="primary-btn" onClick={() => act(async () => {
+        const r = await api("/api/auth/mfa/confirm", "POST", { enrollment_token: setup.enrollment_token, code });
+        setCodes(r.recovery_codes || []); setSetup(null); await reload();
+      })}>確認して有効化</button>
+    </div>}
+    {codes && <div><p>回復コード（1回だけ表示されます。安全に保管してください）</p>
+      <div className="recovery-codes">{codes.map((c) => <code key={c}>{c}</code>)}</div></div>}
+    {status.totp_enabled && <div className="mfa-actions">
+      <label>パスワード<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
+      <label>認証コード<input inputMode="numeric" value={code} onChange={(e) => setCode(e.target.value)} /></label>
+      <button className="secondary-btn" onClick={() => act(async () => {
+        await api("/api/auth/step-up", "POST", { password, code }); setMessage("ステップアップ認証が完了しました（10分間有効）");
+      })}>ステップアップ認証</button>
+      <button className="secondary-btn" onClick={() => act(async () => {
+        await api("/api/auth/step-up", "POST", { password, code });
+        const r = await api("/api/auth/mfa/recovery-codes/regenerate", "POST", {});
+        setCodes(r.recovery_codes || []);
+      })}>回復コードを再発行</button>
+      <button className="secondary-btn" onClick={() => act(async () => {
+        setSetup(await api("/api/auth/mfa/setup", "POST", {}));
+        setMessage("新しい認証器のシークレットを発行しました。上の欄で確認してください");
+      })}>認証器を変更（ステップアップ後）</button>
+      {!status.mandatory && <button className="danger-btn" onClick={() => act(async () => {
+        await api("/api/auth/mfa/disable", "POST", { password, code });
+        setMessage("MFAを解除しました。再ログインしてください"); await reload();
+      })}>MFAを解除</button>}
+    </div>}
+    {isExecutive && <div className="mfa-admin-reset">
+      <h3>管理者によるMFAリセット</h3>
+      <label>対象ユーザーID<input inputMode="numeric" value={resetUserId} onChange={(e) => setResetUserId(e.target.value)} /></label>
+      <label>理由（10〜500文字）<input value={resetReason} onChange={(e) => setResetReason(e.target.value)} /></label>
+      <button className="secondary-btn" onClick={() => act(async () => {
+        const r = await api(`/api/accounts/${Number(resetUserId)}/mfa/reset`, "POST", { reason: resetReason });
+        setGrant(r.recovery_grant || "");
+      })}>リセットして回復認可を発行</button>
+      {grant && <p>回復認可（1回だけ表示。本人へ安全に渡してください）：<code>{grant}</code></p>}
+    </div>}
+    {message && <p className="config-note">{message}</p>}
+    {error && <div className="config-error" role="alert">{error}</div>}
+  </section>;
+}
+
+function CompanySettingsPanel({ api, t, accountRole }) {
+  const [view, setView] = useState(null);
+  const [form, setForm] = useState({});
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+  const [bankForm, setBankForm] = useState({ account_number_op: "keep", account_number: "" });
+  const [stepPassword, setStepPassword] = useState("");
+  const [stepCode, setStepCode] = useState("");
+  const [revealed, setRevealed] = useState("");
+  const isExecutive = ["administrator", "executive"].includes(accountRole);
+  async function reload() {
+    try {
+      const v = await api("/api/company-settings", "GET");
+      setView(v); setForm(v);
+    } catch { setView(null); }
+  }
+  useEffect(() => { reload(); }, []);
+  async function act(fn) { setError(""); setMessage(""); try { await fn(); } catch (e) { setError(e.message || t("error")); } }
+  if (!view) return null;
+  const field = (name, label, type = "text") => <label>{label}<input type={type} value={form[name] ?? ""}
+    disabled={!isExecutive} onChange={(e) => setForm({ ...form, [name]: type === "number" ? (e.target.value === "" ? null : Number(e.target.value)) : e.target.value })} /></label>;
+  return <section className="panel config-panel"><div className="panel-head"><div>
+    <div className="eyebrow">Company</div><h2>会社設定</h2></div><ShieldCheck size={17} className="green-text" /></div>
+    {!view.configured && <p className="config-note">会社情報は未設定です。</p>}
+    {!isExecutive && <p className="config-note">変更は executive のみ可能です（閲覧のみ）。</p>}
+    <div className="company-form">
+      {field("company_name", "会社名")}
+      {field("postal_code", "郵便番号")}
+      {field("address", "住所")}
+      {field("phone", "電話番号")}
+      {field("fax", "FAX")}
+      {field("email", "メールアドレス")}
+      {field("representative_name", "代表者名")}
+      {field("registration_number", "法人番号（T+13桁）")}
+      {view.fiscal_year_start_month !== undefined && field("fiscal_year_start_month", "年度開始月", "number")}
+      {view.closing_day !== undefined && field("closing_day", "締め日", "number")}
+      {view.default_payout_day !== undefined && field("default_payout_day", "支払日", "number")}
+    </div>
+    {isExecutive && <button className="primary-btn" onClick={() => act(async () => {
+      const body = { version: view.version };
+      ["company_name", "postal_code", "address", "phone", "fax", "email", "representative_name",
+        "registration_number", "fiscal_year_start_month", "closing_day", "default_payout_day"]
+        .forEach((k) => { body[k] = form[k] ?? null; });
+      const v = await api("/api/company-settings", "PUT", body);
+      setView(v); setForm(v); setMessage("会社設定を保存しました");
+    })}>保存</button>}
+    {view.bank && <div className="company-bank">
+      <h3>自社銀行口座</h3>
+      <p>{view.bank.bank_name || "—"} {view.bank.bank_branch || ""} {view.bank.account_type || ""}
+        口座番号：{view.bank.account_number_masked || "未設定"} {view.bank.account_holder || ""}</p>
+      {revealed && <p>口座番号：<code>{revealed}</code></p>}
+      <label>ステップアップ用パスワード<input type="password" value={stepPassword} onChange={(e) => setStepPassword(e.target.value)} /></label>
+      <label>認証コード<input inputMode="numeric" value={stepCode} onChange={(e) => setStepCode(e.target.value)} /></label>
+      <button className="secondary-btn" onClick={() => act(async () => {
+        await api("/api/auth/step-up", "POST", { password: stepPassword, code: stepCode });
+        const r = await api("/api/company-settings/bank-account/reveal", "POST", {});
+        setRevealed(r.account_number || "");
+      })}>口座番号を表示（ステップアップ必須）</button>
+      {isExecutive && <>
+        <label>口座番号の操作<select value={bankForm.account_number_op}
+          onChange={(e) => setBankForm({ ...bankForm, account_number_op: e.target.value })}>
+          <option value="keep">変更しない</option><option value="set">設定する</option><option value="clear">クリアする</option></select></label>
+        {bankForm.account_number_op === "set" && <label>口座番号（数字7桁以内）<input value={bankForm.account_number}
+          onChange={(e) => setBankForm({ ...bankForm, account_number: e.target.value })} /></label>}
+        <label>銀行名<input value={bankForm.bank_name ?? view.bank.bank_name ?? ""} onChange={(e) => setBankForm({ ...bankForm, bank_name: e.target.value })} /></label>
+        <label>支店名<input value={bankForm.bank_branch ?? view.bank.bank_branch ?? ""} onChange={(e) => setBankForm({ ...bankForm, bank_branch: e.target.value })} /></label>
+        <label>口座種別<input value={bankForm.account_type ?? view.bank.account_type ?? ""} onChange={(e) => setBankForm({ ...bankForm, account_type: e.target.value })} /></label>
+        <label>口座名義<input value={bankForm.account_holder ?? view.bank.account_holder ?? ""} onChange={(e) => setBankForm({ ...bankForm, account_holder: e.target.value })} /></label>
+        <button className="secondary-btn" onClick={() => act(async () => {
+          await api("/api/auth/step-up", "POST", { password: stepPassword, code: stepCode });
+          const v = await api("/api/company-settings/bank-account", "PUT",
+            { version: view.version, ...bankForm, bank_name: bankForm.bank_name ?? view.bank.bank_name,
+              bank_branch: bankForm.bank_branch ?? view.bank.bank_branch,
+              account_type: bankForm.account_type ?? view.bank.account_type,
+              account_holder: bankForm.account_holder ?? view.bank.account_holder });
+          setView(v); setForm(v); setMessage("銀行口座を保存しました");
+        })}>銀行口座を保存</button>
+      </>}
+    </div>}
+    <div className="company-logo">
+      <h3>ロゴ</h3>
+      {view.logo_url ? <img src={view.logo_url} alt="会社ロゴ" style={{ maxHeight: 64 }} /> : <p>未設定</p>}
+      {isExecutive && <>
+        <input type="file" accept="image/png,image/jpeg" onChange={(e) => {
+          const file = e.target.files?.[0]; if (!file) return;
+          act(async () => {
+            const fd = new FormData(); fd.append("file", file); fd.append("version", String(view.version));
+            const res = await apiFetch(`${API_BASE}/api/company-settings/logo`, { method: "POST", credentials: "include", body: fd });
+            if (!res.ok) { const p = await res.json().catch(() => ({})); throw new Error(p.detail || "アップロードに失敗しました"); }
+            await reload(); setMessage("ロゴを更新しました");
+          });
+        }} />
+        {view.logo_url && <button className="secondary-btn" onClick={() => act(async () => {
+          const res = await apiFetch(`${API_BASE}/api/company-settings/logo?version=${view.version}`, { method: "DELETE", credentials: "include" });
+          if (!res.ok) { const p = await res.json().catch(() => ({})); throw new Error(p.detail || "削除に失敗しました"); }
+          await reload(); setMessage("ロゴを削除しました");
+        })}>ロゴを削除</button>}
+      </>}
+    </div>
+    {message && <p className="config-note">{message}</p>}
+    {error && <div className="config-error" role="alert">{error}</div>}
+  </section>;
+}
+
 function SampleWatermark() {
   return <div className="sample-watermark" aria-hidden="true" />;
 }
-function LoginPage({ locale, setLocale, t, accounts, demoAvailable, error, busy, onLogin }) {
+function LoginPage({ locale, setLocale, t, accounts, demoAvailable, error, busy, onLogin, mfaChallenge, onMfaVerify, needsGrant, brandName, productBrand }) {
   const [accountId, setAccountId] = useState(accounts[0]?.id || "");
   const [employeeCode, setEmployeeCode] = useState("");
   const [password, setPassword] = useState("");
+  const [mfaCode, setMfaCode] = useState("");
+  const [grant, setGrant] = useState("");
   useEffect(() => {
     if (!accounts.some((account) => String(account.id) === String(accountId))) {
       setAccountId(accounts[0]?.id || "");
@@ -1337,6 +1615,8 @@ function LoginPage({ locale, setLocale, t, accounts, demoAvailable, error, busy,
     <section className="login-card">
       <div className="brand-mark"><Home size={21}/></div>
       <p className="eyebrow">SumaiBoard</p><h1>{t("loginTitle")}</h1><p>{t("loginSubtitle")}</p>
+      {productBrand && <div className="product-brand">{brandName && <strong>{brandName}</strong>}
+        <img src="/api/company-settings/logo" alt="" style={{ maxHeight: 48 }} onError={(e) => { e.currentTarget.style.display = "none"; }} /></div>}
       {demoAvailable && <form onSubmit={(event) => {
         event.preventDefault();
         if (accountId) onLogin("/api/auth/demo-login", { account_id: Number(accountId) });
@@ -1351,14 +1631,20 @@ function LoginPage({ locale, setLocale, t, accounts, demoAvailable, error, busy,
       <form onSubmit={(event) => {
         event.preventDefault();
         if (!password) return;
-        onLogin("/api/auth/login", { employee_code: employeeCode, password });
+        onLogin("/api/auth/login", { employee_code: employeeCode, password, ...(grant ? { recovery_grant: grant } : {}) });
       }}>
         <label>{t("employeeCode")}<input autoComplete="username" value={employeeCode}
           onChange={(event) => setEmployeeCode(event.target.value)} required/></label>
         <label>{t("password")}<input autoComplete="current-password" type="password" value={password}
           onChange={(event) => setPassword(event.target.value)} required/></label>
+        {needsGrant && <label>回復認可（グラント）<input value={grant} onChange={(event) => setGrant(event.target.value)} /></label>}
         <button className="secondary-btn login-submit" disabled={busy || !password}>{t("signIn")}</button>
       </form>
+      {mfaChallenge && <form onSubmit={(event) => { event.preventDefault(); onMfaVerify(mfaCode); }}>
+        <label>認証コード（有効期限5分）<input inputMode="numeric" autoComplete="one-time-code" value={mfaCode}
+          onChange={(event) => setMfaCode(event.target.value)} required/></label>
+        <button className="primary-btn login-submit" disabled={busy || !mfaCode}>認証する</button>
+      </form>}
       {error && <div className="config-error" role="alert">{error}</div>}
       <button className="language-btn" onClick={() => setLocale(locale === "ja" ? "zh" : "ja")}
         type="button">{locale === "ja" ? "中文" : "日本語"}</button>
@@ -1884,7 +2170,7 @@ function TrendResult({ metric, period, locale, t, chart }) {
   const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     const controller = new AbortController();
-    fetch(`${API_BASE}/api/dashboard/trends?metric=${metric}&period=${period}`, {
+    apiFetch(`${API_BASE}/api/dashboard/trends?metric=${metric}&period=${period}`, {
       credentials: "include", signal: controller.signal,
     }).then(async (response) => {
       if (!response.ok) throw new Error("Trend request failed");
@@ -2030,7 +2316,7 @@ function Management({ locale, data, t, role, onReminder, onException }) {
   useEffect(() => {
     if (!canLoadOverview) return;
     const controller = new AbortController();
-    fetch(`${API_BASE}/api/management/overview`, { credentials: "include", signal: controller.signal })
+    apiFetch(`${API_BASE}/api/management/overview`, { credentials: "include", signal: controller.signal })
       .then(async (response) => {
         if (!response.ok) throw new Error("Management request failed");
         const data = await response.json();
@@ -2054,7 +2340,7 @@ function Management({ locale, data, t, role, onReminder, onException }) {
     setReportBusy(true);
     setReportError("");
     try {
-      const response = await fetch(`${API_BASE}/api/management/reports`, {
+      const response = await apiFetch(`${API_BASE}/api/management/reports`, {
         method: "POST", credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ report_type: reportType }),
@@ -2184,7 +2470,7 @@ function AuditTrailPanel({ t, userId, locale }) {
     const requestId = ++activeRequest.current;
     setItems([]);
     setSelected(null);
-    fetch(`${API_BASE}/api/audit-events?limit=30`, { credentials: "include" })
+    apiFetch(`${API_BASE}/api/audit-events?limit=30`, { credentials: "include" })
       .then(async (response) => {
         if (!response.ok) throw new Error(t("configLoadError"));
         const result = await response.json();
@@ -2198,7 +2484,7 @@ function AuditTrailPanel({ t, userId, locale }) {
     setError("");
     const requestId = ++activeRequest.current;
     try {
-      const response = await fetch(`${API_BASE}/api/audit-events/${id}`, { credentials: "include" });
+      const response = await apiFetch(`${API_BASE}/api/audit-events/${id}`, { credentials: "include" });
       if (!response.ok) throw new Error(t("configLoadError"));
       const result = await response.json();
       if (requestId === activeRequest.current) setSelected(result);
@@ -2241,7 +2527,7 @@ function ExpensePanel({ data, t, role, accountRole, locale }) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   async function load() {
-    const response = await fetch(`${API_BASE}/api/expenses`, { credentials: "include" });
+    const response = await apiFetch(`${API_BASE}/api/expenses`, { credentials: "include" });
     if (!response.ok) throw new Error(t("configLoadError"));
     const result = await response.json();
     setItems(result.items || []);
@@ -2252,7 +2538,7 @@ function ExpensePanel({ data, t, role, accountRole, locale }) {
     let active = true;
     setItems([]);
     setError("");
-    fetch(`${API_BASE}/api/expenses`, { credentials: "include" })
+    apiFetch(`${API_BASE}/api/expenses`, { credentials: "include" })
       .then(async (response) => {
         if (!response.ok) throw new Error(t("configLoadError"));
         const result = await response.json();
@@ -2269,7 +2555,7 @@ function ExpensePanel({ data, t, role, accountRole, locale }) {
       "通信費": "通信费", "その他": "其他" })[value] || value;
   }
   async function request(url, method, body, isForm = false) {
-    const response = await fetch(`${API_BASE}${url}`, {
+    const response = await apiFetch(`${API_BASE}${url}`, {
       method, credentials: "include",
       headers: isForm ? undefined : { "Content-Type": "application/json" },
       body: body ? (isForm ? body : JSON.stringify(body)) : undefined,
@@ -2380,7 +2666,7 @@ function DataExchangePanel({ data, t, locale }) {
   if (canExportFinance) options.push(["fee_entitlements", "exportFees"], ["invoice_data", "exportInvoices"]);
   const tResource = (key) => t(`export${key[0].toUpperCase()}${key.slice(1)}`);
   async function loadJobs(active = () => true) {
-    const response = await fetch(`${API_BASE}/api/export-jobs`, { credentials: "include" });
+    const response = await apiFetch(`${API_BASE}/api/export-jobs`, { credentials: "include" });
     if (!response.ok) throw new Error(t("configLoadError"));
     const result = await response.json();
     if (active()) setJobs(result.items || []);
@@ -2403,7 +2689,7 @@ function DataExchangePanel({ data, t, locale }) {
     event.preventDefault();
     setBusy(true); setError("");
     try {
-      const response = await fetch(`${API_BASE}/api/export-jobs`, {
+      const response = await apiFetch(`${API_BASE}/api/export-jobs`, {
         method: "POST", credentials: "include", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ resource, include_personal_data: includePersonalData, format }),
       });
@@ -2427,7 +2713,7 @@ function DataExchangePanel({ data, t, locale }) {
       const body = new FormData();
       body.append("file", importFile);
       body.append("mapping_json", JSON.stringify(importMapping));
-      const response = await fetch(`${API_BASE}/api/imports/kintone/preview`, {
+      const response = await apiFetch(`${API_BASE}/api/imports/kintone/preview`, {
         method: "POST", credentials: "include", body,
       });
       const result = await response.json().catch(() => ({}));
@@ -2448,12 +2734,12 @@ function DataExchangePanel({ data, t, locale }) {
       body.append("file", importFile);
       body.append("preview_job_id", previewResult.id);
       body.append("mapping_json", JSON.stringify(importMapping));
-      const response = await fetch(`${API_BASE}/api/imports/kintone`, {
+      const response = await apiFetch(`${API_BASE}/api/imports/kintone`, {
         method: "POST", credentials: "include", body,
       });
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.detail || t("error"));
-      const detailResponse = await fetch(`${API_BASE}/api/import-jobs/${result.id}`, { credentials: "include" });
+      const detailResponse = await apiFetch(`${API_BASE}/api/import-jobs/${result.id}`, { credentials: "include" });
       if (!detailResponse.ok) throw new Error(t("configLoadError"));
       setImportResult(await detailResponse.json());
       setImportFile(null);
@@ -2537,7 +2823,7 @@ function ImportResultTable({ rows, t, importReason }) {
       <td>{t(row.status === "READY" ? "previewReady" : `importStatus${row.status}`)}</td><td>{importReason(row.reason)}</td>
     </tr>)}</tbody></table></div>;
 }
-function SettingsPage({ data, t, role, locale, onLocaleChange, onReset, onConfigSaved, preferences, onSavePreferences, sampleMode }) {
+function SettingsPage({ data, t, role, locale, onLocaleChange, onReset, onConfigSaved, preferences, onSavePreferences, sampleMode, api }) {
   return <div className="admin-page settings-page"><PageTitle eyebrow={t("systemPreferences")} title={t("settings")} sub={t("settingsSub")}/>
     <div className="settings-grid"><section className="panel setting-card"><div className="setting-icon"><Users size={19}/></div><div><h2>{t("role")}</h2><p>{t("currentRole")}：{roleLabel(locale, role)}。{t("roleDescription")}</p>
       <div className="setting-roles">{data.roles.map((r) => <span className={`role-chip ${r.id === role ? "current" : ""}`} key={r.id}>{roleLabel(locale, r.id)} {r.id === role && <Check size={13}/>}</span>)}</div></div></section>
@@ -2551,6 +2837,8 @@ function SettingsPage({ data, t, role, locale, onLocaleChange, onReset, onConfig
     {!sampleMode && <DataExchangePanel data={data} t={t} locale={locale}/>}
     {!sampleMode && <MonthClosePanel accountRole={data.account_role} userId={data.user.id} t={t}/>}
     {!sampleMode && <DataCorrectionPanel accountRole={data.account_role} t={t} locale={locale}/>}
+    {!sampleMode && api && <CompanySettingsPanel api={api} t={t} accountRole={data.account_role}/>}
+    {!sampleMode && api && <MfaSettingsPanel api={api} t={t} accountRole={data.account_role}/>}
     <OperationsPanel accountRole={data.account_role} locale={locale} t={t}/>
     <section className="panel config-panel"><div className="panel-head"><div><div className="eyebrow">{t("versionedOperations")}</div><h2>{t("systemConfig")}</h2></div><ShieldCheck size={17} className="green-text"/></div>
       {role === "hq_finance" ? <SystemConfigPanel role={role} locale={locale} t={t} onSaved={onConfigSaved}/> :
@@ -2580,8 +2868,8 @@ function MonthClosePanel({ accountRole, userId, t }) {
   };
   async function load() {
     const [closeResponse, lockResponse] = await Promise.all([
-      fetch(`${API_BASE}/api/month-closes?period=${encodeURIComponent(period)}`, { credentials: "include" }),
-      fetch(`${API_BASE}/api/month-closes/lock-matrix?period=${encodeURIComponent(period)}`, { credentials: "include" }),
+      apiFetch(`${API_BASE}/api/month-closes?period=${encodeURIComponent(period)}`, { credentials: "include" }),
+      apiFetch(`${API_BASE}/api/month-closes/lock-matrix?period=${encodeURIComponent(period)}`, { credentials: "include" }),
     ]);
     if (!closeResponse.ok || !lockResponse.ok) throw new Error(t("monthCloseError"));
     const [closeData, lockData] = await Promise.all([closeResponse.json(), lockResponse.json()]);
@@ -2597,7 +2885,7 @@ function MonthClosePanel({ accountRole, userId, t }) {
     setBusy(true);
     setError("");
     try {
-      const response = await fetch(`${API_BASE}${path}`, {
+      const response = await apiFetch(`${API_BASE}${path}`, {
         method: "POST", credentials: "include",
         headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
       });
@@ -2611,7 +2899,7 @@ function MonthClosePanel({ accountRole, userId, t }) {
   }
   async function showSnapshot(item) {
     try {
-      const response = await fetch(`${API_BASE}/api/month-closes/${item.id}/detail`, { credentials: "include" });
+      const response = await apiFetch(`${API_BASE}/api/month-closes/${item.id}/detail`, { credentials: "include" });
       if (!response.ok) throw new Error(t("monthCloseError"));
       setSelected(await response.json());
       setError("");
@@ -2681,7 +2969,7 @@ function DataCorrectionPanel({ accountRole, t, locale }) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
   async function load() {
-    const response = await fetch(`${API_BASE}/api/data-corrections?status=PENDING`, { credentials: "include" });
+    const response = await apiFetch(`${API_BASE}/api/data-corrections?status=PENDING`, { credentials: "include" });
     if (!response.ok) throw new Error(t("monthCloseError"));
     const result = await response.json();
     setItems(result.items);
@@ -2693,7 +2981,7 @@ function DataCorrectionPanel({ accountRole, t, locale }) {
     setBusy(item.id);
     setError("");
     try {
-      const response = await fetch(`${API_BASE}/api/data-corrections/${item.id}/decision`, {
+      const response = await apiFetch(`${API_BASE}/api/data-corrections/${item.id}/decision`, {
         method: "POST", credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ version: item.version, action, note: notes[item.id] || "" }),
@@ -2735,7 +3023,7 @@ function OperationsPanel({ accountRole, locale, t }) {
     setBusy(true);
     setError("");
     try {
-      const response = await fetch(`${API_BASE}/api/operations/status`, { credentials: "include" });
+      const response = await apiFetch(`${API_BASE}/api/operations/status`, { credentials: "include" });
       if (!response.ok) throw new Error(t("monthCloseError"));
       setStatus(await response.json());
     } catch (loadError) { setError(loadError.message || t("error")); }
@@ -2793,7 +3081,7 @@ function SystemConfigPanel({ role, locale, t, onSaved }) {
   const [error, setError] = useState("");
   const [saving, setSaving] = useState("");
   useEffect(() => {
-    fetch(`${API_BASE}/api/system-config`, { credentials: "include" })
+    apiFetch(`${API_BASE}/api/system-config`, { credentials: "include" })
       .then(async (response) => {
         if (!response.ok) throw new Error(t("configLoadError"));
         return response.json();
@@ -2811,7 +3099,7 @@ function SystemConfigPanel({ role, locale, t, onSaved }) {
     catch { setError(locale === "ja" ? "JSON形式を確認してください。" : "请检查 JSON 格式。"); return; }
     setSaving(item.key);
     try {
-      const response = await fetch(`${API_BASE}/api/system-config/${encodeURIComponent(item.key)}`, {
+      const response = await apiFetch(`${API_BASE}/api/system-config/${encodeURIComponent(item.key)}`, {
         method: "PUT",
         credentials: "include", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ value, reason }),
@@ -2898,7 +3186,7 @@ function ReferralDocumentPanel({ introductionId, t, api }) {
   };
   useEffect(() => {
     let active = true;
-    fetch(`${API_BASE}/api/introductions/${introductionId}/referral-documents`, { credentials: "include" })
+    apiFetch(`${API_BASE}/api/introductions/${introductionId}/referral-documents`, { credentials: "include" })
       .then(async (response) => {
         if (!response.ok) throw new Error(t("referralDocumentFailed"));
         return response.json();

@@ -31,3 +31,14 @@ docker compose -f docker-compose.dev.yml up -d --build
 ```
 
 初回はイメージのビルドとサンプルデータの初期化に数分かかることがあります。`curl -fsS http://127.0.0.1:18083/api/health` が `{"status":"ok"}` を返したら、ブラウザーで `http://127.0.0.1:18083/` を開きます。公開環境の配備手順とデータ分離の詳細は [DEPLOY.md](DEPLOY.md) と [公開サンプルのデプロイ境界](docs/sample-deployment-boundary.md) を参照してください。
+
+## 製品デプロイ（V3.1.0 / G1-01）
+
+V3.1.0 から、同一コードベースを2つの形態でデプロイできます。
+
+- **sample**: 公開サンプル（架空データ、毎日04:00リセット、ウォーターマーク表示）
+- **product**: 単一テナント製品版（実データ、MFA必須ロール、会社設定、バックアップ/監視）
+
+形態は環境変数 `DEPLOYMENT_PROFILE`（必須・デフォルトなし）で決まります。主要な環境変数: `DEPLOYMENT_ID`、`DEPLOYMENT_TENANT_ID`（product は任意の正整数、sample は 1 固定）、`PUBLIC_ORIGIN`、`MFA_ENCRYPTION_KEY`、`ATTACHMENT_STORAGE_DIR`、`BACKUP_DIR`、`OPS_STATUS_TOKEN`、`MONITOR_WEBHOOK_URL`、`OFFSITE_RSYNC_TARGET`。
+
+手順と運用の正本は [製品デプロイガイド](docs/product-deployment-guide.md)、[バックアップ/リストア運用手順](docs/backup-restore-runbook.md)、[監視運用手順](docs/monitoring-runbook.md)、[テナント制約一覧](docs/tenant-constraints-inventory.md) を参照してください。スクリプトは `scripts/`（backup / restore / verify-restore / deploy / rollback / monitor / preflight-isolation / check-tenant-literals / mfa-emergency-reset / reset-sample）にあります。テストは `python3 -m unittest discover -s tests` で実行できます。

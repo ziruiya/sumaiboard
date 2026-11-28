@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { apiFetch } from "./api.js";
 import { todayJst } from "./jst-date.js";
 import {
   ArrowLeft, CalendarDays, ChevronLeft, ChevronRight, MessageSquare, Plus, Search,
@@ -23,7 +24,7 @@ const eventDateTime = (date, hour = 10) => {
 const toLocalInput = (value) => value ? String(value).slice(0, 16) : "";
 
 async function request(path, method = "GET", body, locale = "ja") {
-  const response = await fetch(`${API_BASE}${path}`, {
+  const response = await apiFetch(`${API_BASE}${path}`, {
     method, credentials: "include",
     headers: body ? { "Content-Type": "application/json" } : undefined,
     body: body ? JSON.stringify(body) : undefined,

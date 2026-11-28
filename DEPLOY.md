@@ -129,3 +129,12 @@ sudo docker volume ls | grep -E 'mysql-data|referral-documents'
 - 更新版を配布した場合は、バックアップ後に `sudo docker compose up -d --build` で再ビルドします。
 - DB パスワードを変更する際は `.env` と MySQL 側のユーザー認証を同時に更新してください。MySQL 初期化時に作成したユーザーのパスワードは、`.env` だけ変更しても既存 volume 上では自動変更されません。
 - このプロトタイプは実顧客情報・本番業務データを扱う設計ではありません。外部公開前に OS、宝塔、Docker の更新と `.env`・DB バックアップを整備してください。
+
+---
+
+## V3.1.0 追補（G1-01 単一テナント製品地基）
+
+- デプロイ形態は `DEPLOYMENT_PROFILE`（sample/product、必須）で決定します。現行の公開サンプルは `sample` として明示し、`DEPLOYMENT_ID`（サンプル用に生成）と `DEPLOYMENT_TENANT_ID=1` を `.env` に追加してください。product 形態では `DEMO_MODE` / `PUBLIC_SAMPLE_MODE` / `SAMPLE_RESET_TOKEN` が有効だと起動しません。
+- 旧バージョンからの初回起動時、既存セッションは `auth.policy_epoch` の一回限りの繰り上げ（1→2）で全失効します。履歴サンプルDBを引き継ぐ場合のみ、初回起動に限り `LEGACY_MIGRATION_AUTHORIZED=sample` を設定し、移行完了後に削除してください。
+- デプロイ/ロールバックは `scripts/deploy.sh` / `scripts/rollback.sh` を使用します（git archive による不変ソース、昇格前 pinned バックアップ、スナップショット、readiness + smoke）。product へのロールバックは `g1_01_secure=true` のリリースに限ります。
+- バックアップは `scripts/backup.sh`（アプリ停止型・整合性方式A）、監視は `scripts/monitor.sh`（5分間隔 cron）を参照してください。詳細は docs/ 配下の運用手順が正本です。

@@ -1,5 +1,6 @@
 import React from "react";
 import { useEffect, useState } from "react";
+import { apiFetch } from "./api.js";
 import { todayJst } from "./jst-date.js";
 
 export const rentalPages = [
@@ -23,7 +24,7 @@ function useRentalData(apiBase, path) {
   const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     const controller = new AbortController();
-    fetch(`${apiBase}/api/rental/${path}`, { credentials: "include", signal: controller.signal })
+    apiFetch(`${apiBase}/api/rental/${path}`, { credentials: "include", signal: controller.signal })
       .then(async (response) => {
         if (!response.ok) throw new Error("Rental request failed");
         return response.json();
@@ -409,7 +410,7 @@ function RentalForm({ apiBase, resource, record, action, preset, onSaved, onCanc
     if (editingAssignments) payload.units = assignments.map(({ unit_id, valid_from, valid_to }) => ({ unit_id, valid_from, valid_to }));
     const path = record ? `${resource}/${record.id}${action ? `/${action[0]}` : ""}` : resource;
     try {
-      const response = await fetch(`${apiBase}/api/rental/${path}`, {
+      const response = await apiFetch(`${apiBase}/api/rental/${path}`, {
         method: record && !action ? "PUT" : "POST", credentials: "include",
         headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
       });
@@ -664,7 +665,7 @@ function useMoneyAction(apiBase) {
     setBusy(true);
     setError("");
     try {
-      const response = await fetch(`${apiBase}/api/rental/${path}`, {
+      const response = await apiFetch(`${apiBase}/api/rental/${path}`, {
         method: "POST", credentials: "include",
         headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
       });

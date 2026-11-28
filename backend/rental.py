@@ -13,7 +13,9 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pymysql.err import IntegrityError, OperationalError
 
-TENANT_ID = 1
+from backend.deployment_context import deployment_tenant_id
+
+TENANT_ID = deployment_tenant_id()
 JST = ZoneInfo("Asia/Tokyo")
 
 # Tables are declared in dependency order so reset can drop them in reverse order.

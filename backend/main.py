@@ -8,11 +8,12 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import time
 import unicodedata
 import uuid
 from collections import OrderedDict, deque
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -20,11 +21,18 @@ from urllib.parse import quote
 
 import pymysql
 from pymysql.cursors import DictCursor
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from backend.deployment_context import (
+    deployment_id,
+    deployment_profile,
+    deployment_tenant_id,
+    get_deployment_context,
+    parse_origin,
+)
 from backend.pdf_export import PDF_TEMPLATE_VERSION, build_pdf_isolated
 from backend import rental
 
@@ -44,17 +52,39 @@ DB_CONFIG = {
 REFERRAL_STORAGE_DIR = Path(os.getenv(
     "REFERRAL_STORAGE_DIR", "/app/private_storage/referral-documents"
 ))
-
-app = FastAPI(title="SumaiBoard", version="0.1.0")
-LOGGER = logging.getLogger("sumaiboard")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+APP_VERSION = os.getenv("APP_VERSION", "3.1.0").strip() or "3.1.0"
+MAINTENANCE_FLAG_FILE = Path(
+    os.getenv("MAINTENANCE_FLAG_FILE", "/app/run/maintenance.flag").strip()
+    or "/app/run/maintenance.flag"
 )
+MFA_KEY_PROBE_PLAINTEXT = b"sumaiboard-mfa-key-probe-v1"
+_TRUSTED_PUBLIC_ORIGIN: Optional[tuple[str, str, int]] = None
+_PUBLIC_ORIGIN_SCHEME: str = "http"
+STARTUP_STATE = {
+    "ready": False,
+    "state": None,
+    "self_check": {},
+    "started_at": None,
+    "ready_at": None,
+}
+
+app = FastAPI(title="SumaiBoard", version=APP_VERSION)
+LOGGER = logging.getLogger("sumaiboard")
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS deployment_identity (
+  id TINYINT PRIMARY KEY,
+  profile VARCHAR(16) NOT NULL,
+  tenant_id INT NOT NULL,
+  deployment_id VARCHAR(64) NOT NULL,
+  bootstrap_completed_at DATETIME NULL,
+  created_at DATETIME NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tenants (
+  id INT PRIMARY KEY,
+  name VARCHAR(120) NOT NULL,
+  created_at DATETIME NOT NULL
+);
 CREATE TABLE IF NOT EXISTS stores (
   id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(120) NOT NULL, area VARCHAR(120) NOT NULL,
   opened_at DATE NULL
@@ -67,6 +97,9 @@ CREATE TABLE IF NOT EXISTS users (
   locked_until DATETIME NULL, must_change_password TINYINT NOT NULL DEFAULT 1,
   last_login_at DATETIME NULL, password_changed_at DATETIME NULL, last_password_reset_at DATETIME NULL,
   version INT NOT NULL DEFAULT 1,
+  totp_secret_enc VARCHAR(512) NULL, totp_enabled TINYINT NOT NULL DEFAULT 0,
+  totp_confirmed_at DATETIME NULL, totp_last_step BIGINT NULL,
+  auth_epoch INT NOT NULL DEFAULT 1, mfa_reset_pending TINYINT NOT NULL DEFAULT 0,
   FOREIGN KEY (store_id) REFERENCES stores(id)
 );
 CREATE TABLE IF NOT EXISTS households (
@@ -309,6 +342,9 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
   id CHAR(36) PRIMARY KEY, user_id INT NOT NULL, token_hash CHAR(64) NOT NULL UNIQUE,
   created_at DATETIME NOT NULL, last_seen_at DATETIME NOT NULL, expires_at DATETIME NOT NULL,
   revoked_at DATETIME NULL, source_ip VARCHAR(64) NULL, user_agent_hash CHAR(64) NULL,
+  auth_stage VARCHAR(32) NOT NULL DEFAULT 'FULL', auth_epoch INT NOT NULL DEFAULT 1,
+  policy_epoch INT NOT NULL DEFAULT 1, step_up_at DATETIME NULL,
+  recovery_flow TINYINT NOT NULL DEFAULT 0,
   INDEX idx_auth_sessions_user(user_id,revoked_at)
 );
 CREATE TABLE IF NOT EXISTS auth_login_attempts (
@@ -316,6 +352,50 @@ CREATE TABLE IF NOT EXISTS auth_login_attempts (
   source_ip VARCHAR(64) NULL, attempted_at DATETIME NOT NULL, succeeded TINYINT NOT NULL DEFAULT 0,
   INDEX idx_login_attempts_identity(identity_hash,attempted_at),
   INDEX idx_login_attempts_ip(source_ip,attempted_at)
+);
+
+CREATE TABLE IF NOT EXISTS auth_mfa_challenges (
+  id CHAR(36) PRIMARY KEY, user_id INT NOT NULL, token_hash CHAR(64) NOT NULL UNIQUE,
+  purpose VARCHAR(16) NOT NULL DEFAULT 'login', auth_epoch INT NOT NULL DEFAULT 1,
+  policy_epoch INT NOT NULL DEFAULT 1,
+  created_at DATETIME NOT NULL, expires_at DATETIME NOT NULL,
+  failed_attempts INT NOT NULL DEFAULT 0, consumed_at DATETIME NULL,
+  invalidated_at DATETIME NULL, source_ip VARCHAR(64) NULL,
+  INDEX idx_mfa_challenges_user(user_id, expires_at)
+);
+CREATE TABLE IF NOT EXISTS mfa_enrollments (
+  id CHAR(36) PRIMARY KEY, user_id INT NOT NULL, pending_secret_enc VARCHAR(512) NOT NULL,
+  token_hash CHAR(64) NOT NULL UNIQUE, initiating_session_id CHAR(36) NULL,
+  created_at DATETIME NOT NULL, expires_at DATETIME NOT NULL,
+  consumed_at DATETIME NULL, invalidated_at DATETIME NULL,
+  INDEX idx_mfa_enrollments_user(user_id, expires_at)
+);
+CREATE TABLE IF NOT EXISTS user_recovery_codes (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY, user_id INT NOT NULL, code_hash CHAR(64) NOT NULL,
+  used_at DATETIME NULL, created_at DATETIME NOT NULL,
+  INDEX idx_recovery_codes_user(user_id, used_at)
+);
+CREATE TABLE IF NOT EXISTS mfa_recovery_grants (
+  id CHAR(36) PRIMARY KEY, user_id INT NOT NULL, token_hash CHAR(64) NOT NULL UNIQUE,
+  auth_epoch INT NOT NULL DEFAULT 1, created_by VARCHAR(64) NOT NULL,
+  created_at DATETIME NOT NULL, expires_at DATETIME NOT NULL,
+  consumed_at DATETIME NULL, invalidated_at DATETIME NULL,
+  INDEX idx_mfa_grants_user(user_id, expires_at)
+);
+CREATE TABLE IF NOT EXISTS company_settings (
+  id INT AUTO_INCREMENT PRIMARY KEY, tenant_id INT NOT NULL UNIQUE,
+  company_name VARCHAR(160) NOT NULL DEFAULT '', postal_code VARCHAR(16) NULL,
+  address VARCHAR(500) NULL, phone VARCHAR(40) NULL, fax VARCHAR(40) NULL,
+  email VARCHAR(255) NULL, representative_name VARCHAR(120) NULL,
+  registration_number VARCHAR(20) NULL,
+  fiscal_year_start_month INT NULL, closing_day INT NULL, default_payout_day INT NULL,
+  bank_name VARCHAR(120) NULL, bank_branch VARCHAR(120) NULL, account_type VARCHAR(40) NULL,
+  account_number VARCHAR(7) NULL, account_holder VARCHAR(160) NULL,
+  logo_file_key VARCHAR(300) NULL, version INT NOT NULL DEFAULT 1,
+  created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,
+  CONSTRAINT chk_company_fiscal_month CHECK (fiscal_year_start_month IS NULL OR fiscal_year_start_month BETWEEN 1 AND 12),
+  CONSTRAINT chk_company_closing_day CHECK (closing_day IS NULL OR closing_day BETWEEN 1 AND 31),
+  CONSTRAINT chk_company_payout_day CHECK (default_payout_day IS NULL OR default_payout_day BETWEEN 1 AND 31)
 );
 CREATE TABLE IF NOT EXISTS password_history (
   id BIGINT AUTO_INCREMENT PRIMARY KEY, user_id INT NOT NULL,
@@ -433,6 +513,7 @@ ACCOUNT_ROLES = {
 }
 
 SYSTEM_CONFIG_DEFAULTS = {
+    "auth.mfa_required_roles": [],
     "auth.password_min_length": 12,
     "auth.password_require_uppercase": True,
     "auth.password_require_lowercase": True,
@@ -568,19 +649,32 @@ def construction_confirmation_backlog(db, store_id=None):
     return int(db.execute(sql, args).fetchone()["count"])
 
 
+def is_product_profile():
+    return deployment_profile() == "product"
+
+
+def is_sample_profile():
+    return deployment_profile() == "sample"
+
+
 def demo_mode_enabled():
+    if is_product_profile():
+        return False
     return os.getenv("DEMO_MODE", "false").strip().lower() == "true"
 
 
 def public_sample_mode_enabled():
+    if is_product_profile():
+        return False
     return os.getenv("PUBLIC_SAMPLE_MODE", "false").strip().lower() == "true"
 
 
 SAMPLE_GUEST_EMPLOYEE_CODE = os.getenv("SAMPLE_GUEST_EMPLOYEE_CODE", "EX-01")
 SAMPLE_BLOCK_MESSAGE = "公開サンプルではこの操作はできません（表示データはすべて架空で、毎日自動リセットされます）"
 
+
 def sample_or_demo_enabled():
-    return demo_mode_enabled() or public_sample_mode_enabled()
+    return is_sample_profile() and (demo_mode_enabled() or public_sample_mode_enabled())
 
 
 # Public sample API classification. Exact method/path pairs cover shell reads,
@@ -588,9 +682,9 @@ def sample_or_demo_enabled():
 # Every other API route (including legacy business APIs and admin writes) is 410.
 _SAMPLE_EXACT = {
     "GET": {
-        "/api/health", "/api/public-config", "/api/bootstrap", "/api/auth/demo-accounts",
-        "/api/notifications", "/api/calendar", "/api/bulletin", "/api/audit-events",
-        "/api/system-config", "/api/accounts", "/api/operations/status",
+        "/api/health", "/api/health/ready", "/api/public-config", "/api/bootstrap",
+        "/api/auth/demo-accounts", "/api/notifications", "/api/calendar", "/api/bulletin",
+        "/api/audit-events", "/api/system-config", "/api/accounts", "/api/operations/status",
     },
     "POST": {
         "/api/auth/login", "/api/auth/logout", "/api/auth/demo-login", "/api/auth/guest-login",
@@ -663,15 +757,26 @@ class SampleGuardMiddleware:
         self.write_windows = OrderedDict()
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or not sample_or_demo_enabled():
+        if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
         method = scope["method"]
         raw_path = scope["path"]
+        path = raw_path.removesuffix("/")
+        if is_product_profile():
+            if path in ("/api/reset", "/api/auth/guest-login", "/api/auth/demo-login", "/api/auth/demo-accounts"):
+                await JSONResponse({"detail": "この環境ではデモ・サンプル機能は無効です"}, status_code=403)(
+                    scope, receive, send
+                )
+                return
+            await self.app(scope, receive, send)
+            return
+        if not sample_or_demo_enabled():
+            await self.app(scope, receive, send)
+            return
         if not raw_path.startswith("/api/"):
             await self.app(scope, receive, send)
             return
-        path = raw_path.removesuffix("/")
         public_sample = public_sample_mode_enabled()
         if self.reset_failed:
             await JSONResponse({"detail": "サンプルデータのリセットに失敗しました"},
@@ -793,7 +898,67 @@ class SampleGuardMiddleware:
         await self.app(scope, receive, send)
 
 
+class CsrfMiddleware:
+    """Enforce X-Requested-With and strict PUBLIC_ORIGIN match on state-changing /api/ calls."""
+
+    _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        raw_path = scope["path"]
+        method = scope["method"]
+        if not raw_path.startswith("/api/") or method in self._SAFE_METHODS:
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope)
+        if "origin" in request.headers:
+            origin_val = request.headers.get("origin", "")
+            try:
+                parsed_origin = parse_origin(origin_val)
+            except ValueError:
+                await JSONResponse({"detail": "Origin検証に失敗しました"}, status_code=403)(scope, receive, send)
+                return
+            if _TRUSTED_PUBLIC_ORIGIN is None or parsed_origin != _TRUSTED_PUBLIC_ORIGIN:
+                await JSONResponse({"detail": "Origin検証に失敗しました"}, status_code=403)(scope, receive, send)
+                return
+        # SEC-01: every state-changing /api/ request requires the header,
+        # whether or not a session cookie is present yet (login included).
+        if request.headers.get("x-requested-with") != "XMLHttpRequest":
+            await JSONResponse({"detail": "CSRFヘッダが必要です"}, status_code=403)(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+class MaintenanceMiddleware:
+    """Reject non-health API requests with 503 while MAINTENANCE_FLAG_FILE exists."""
+
+    _ALLOWED_PATHS = frozenset({"/api/health", "/api/health/ready", "/api/ops/status-detail"})
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            raw_path = scope["path"]
+            path = raw_path.removesuffix("/")
+            if raw_path.startswith("/api/") and path not in self._ALLOWED_PATHS:
+                if MAINTENANCE_FLAG_FILE.exists():
+                    await JSONResponse(
+                        {"detail": "現在メンテナンス中のため利用できません"},
+                        status_code=503,
+                    )(scope, receive, send)
+                    return
+        await self.app(scope, receive, send)
+
+
 app.add_middleware(SampleGuardMiddleware)
+app.add_middleware(CsrfMiddleware)
+app.add_middleware(MaintenanceMiddleware)
 
 
 def hash_secret(secret):
@@ -901,6 +1066,23 @@ class CurrentActor(str):
         return actor
 
 
+def get_policy_epoch(db) -> int:
+    row = db.execute(
+        "SELECT value_json FROM system_configs WHERE config_key=?", ("auth.policy_epoch",)
+    ).fetchone()
+    if not row:
+        return 1
+    val = json.loads(row["value_json"]) if isinstance(row["value_json"], str) else row["value_json"]
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _cookie_secure(request: Request) -> bool:
+    return (_PUBLIC_ORIGIN_SCHEME == "https") or (request.url.scheme == "https")
+
+
 async def require_actor(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
     if not token:
@@ -908,9 +1090,14 @@ async def require_actor(request: Request):
     now = now_jst()
     with connect() as db:
         idle_timeout = config_value(db, "auth.session_idle_timeout_minutes")
+        current_policy_epoch = get_policy_epoch(db)
         row = db.execute(
-            """SELECT s.id AS session_id,s.expires_at,s.last_seen_at,u.id,u.role,u.store_id,
-                      u.account_status,u.must_change_password
+            """SELECT s.id AS session_id,s.expires_at,s.last_seen_at,s.auth_stage,
+                      s.step_up_at,s.recovery_flow,
+                      s.auth_epoch AS session_auth_epoch,s.policy_epoch AS session_policy_epoch,
+                      u.id,u.role,u.store_id,u.account_status,u.must_change_password,
+                      u.totp_enabled,u.mfa_reset_pending,
+                      u.auth_epoch AS user_auth_epoch
                FROM auth_sessions s JOIN users u ON u.id=s.user_id
                WHERE s.token_hash=? AND s.revoked_at IS NULL""",
             (token_digest(token),),
@@ -918,41 +1105,67 @@ async def require_actor(request: Request):
         if not row or row["account_status"] != "ACTIVE":
             raise HTTPException(401, "認証が必要です")
         idle_limit = now - timedelta(minutes=idle_timeout)
-        if row["expires_at"] <= now or row["last_seen_at"] < idle_limit:
+        if (
+            row["expires_at"] <= now
+            or row["last_seen_at"] < idle_limit
+            or int(row["session_policy_epoch"]) != current_policy_epoch
+            or int(row["session_auth_epoch"]) != int(row["user_auth_epoch"])
+        ):
             db.execute("UPDATE auth_sessions SET revoked_at=? WHERE id=?", (now, row["session_id"]))
             db.commit()
             raise HTTPException(401, "認証が必要です")
+        # G1-01 4.4/4.5: auth-stage enforcement + FULL compliance recheck.
+        auth_stage = row["auth_stage"] or "FULL"
+        if auth_stage == "FULL" and deployment_profile() == "product":
+            if (not row["totp_enabled"] and _normalized_role(row["role"]) in _mfa_required_roles(db)) or row["mfa_reset_pending"]:
+                db.execute("UPDATE auth_sessions SET auth_stage='MFA_ENROLLMENT_REQUIRED' WHERE id=?",
+                           (row["session_id"],))
+                auth_stage = "MFA_ENROLLMENT_REQUIRED"
+        if auth_stage == "PASSWORD_CHANGE_REQUIRED" and request.url.path not in (
+                "/api/bootstrap", "/api/auth/logout", "/api/auth/change-password",
+                "/api/auth/mfa/status"):
+            raise HTTPException(403, "パスワード変更が必要です")
+        if auth_stage == "MFA_ENROLLMENT_REQUIRED" and request.url.path not in (
+                "/api/bootstrap", "/api/auth/logout", "/api/auth/mfa/setup",
+                "/api/auth/mfa/confirm", "/api/auth/mfa/status"):
+            raise HTTPException(403, "MFA登録が必要です")
         if row["role"] == "owner" and request.url.path not in (
                 "/api/bootstrap", "/api/auth/logout", "/api/notifications"):
             if not request.url.path.startswith("/api/rental/"):
                 raise HTTPException(403, "オーナーアカウントからこの操作はできません")
         if row["must_change_password"] and request.url.path not in (
-                "/api/bootstrap", "/api/auth/change-password", "/api/auth/logout"):
+                "/api/bootstrap", "/api/auth/change-password", "/api/auth/logout",
+                "/api/auth/mfa/status"):
             raise HTTPException(403, "初回ログイン時にパスワードを変更してください")
         db.execute("UPDATE auth_sessions SET last_seen_at=? WHERE id=?", (now, row["session_id"]))
         request.state.actor = dict(row)
         return CurrentActor(row["role"], row["id"], row["store_id"])
 
 
-def create_session(db, user_id, request):
+def create_session(db, user_id, request, auth_stage="FULL", recovery_flow=False):
     token = secrets.token_urlsafe(48)
     now = now_jst()
     timeout_hours = config_value(db, "auth.session_absolute_timeout_hours")
     session_id = str(uuid.uuid4())
     ua = request.headers.get("user-agent", "")
+    user_row = db.execute("SELECT auth_epoch FROM users WHERE id=?", (user_id,)).fetchone()
+    user_auth_epoch = int(user_row["auth_epoch"]) if user_row else 1
+    policy_epoch = get_policy_epoch(db)
     db.execute(
         """INSERT INTO auth_sessions(id,user_id,token_hash,created_at,last_seen_at,expires_at,
-           source_ip,user_agent_hash) VALUES(?,?,?,?,?,?,?,?)""",
+           source_ip,user_agent_hash,auth_stage,auth_epoch,policy_epoch,recovery_flow)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
         (session_id, user_id, token_digest(token), now, now,
          now + timedelta(hours=timeout_hours),
          request.client.host if request.client else None,
-         hashlib.sha256(ua.encode("utf-8")).hexdigest()),
+         hashlib.sha256(ua.encode("utf-8")).hexdigest(),
+         auth_stage, user_auth_epoch, policy_epoch, 1 if recovery_flow else 0),
     )
     return token
 
 
 def set_session_cookie(request: Request, response: Response, token: str, max_age_hours):
-    response.set_cookie(SESSION_COOKIE, token, httponly=True, secure=request.url.scheme == "https",
+    response.set_cookie(SESSION_COOKIE, token, httponly=True, secure=_cookie_secure(request),
                         samesite="lax", max_age=max_age_hours * 3600, path="/")
 
 
@@ -1028,7 +1241,7 @@ class Database:
         self.connection.close()
 
 
-def audit(db, user_id, action, target_type, target_id, detail):
+def audit(db, user_id, action, target_type, target_id, detail, actor_role_override=None):
     actor = db.execute("SELECT role FROM users WHERE id=?", (user_id,)).fetchone() if user_id else None
     event_at = now_jst().isoformat(timespec="seconds")
     numeric_target_id = target_id if type(target_id) is int else None
@@ -1039,7 +1252,7 @@ def audit(db, user_id, action, target_type, target_id, detail):
     previous_hash = previous_hash["last_hash"] if previous_hash else "0" * 64
     event = {
         "actor_id": user_id,
-        "actor_role": actor["role"] if actor else "system",
+        "actor_role": actor_role_override or (actor["role"] if actor else "system"),
         "action": action,
         "object_type": target_type,
         "object_id": numeric_target_id,
@@ -1305,6 +1518,7 @@ class DemoLoginInput(BaseModel):
 class PasswordLoginInput(BaseModel):
     employee_code: str
     password: str
+    recovery_grant: Optional[str] = None
 
 
 class PasswordResetRequestInput(BaseModel):
@@ -1324,12 +1538,7 @@ class ChangePasswordInput(BaseModel):
 
 @app.get("/api/auth/demo-accounts")
 def demo_accounts(request: Request):
-    if not sample_or_demo_enabled():
-        with connect() as db:
-            audit(db, None, "demo.login.disabled", "security", None,
-                  json.dumps({"source_ip": request.client.host if request.client else None,
-                              "user_agent": request.headers.get("user-agent", "")[:200]}))
-            db.commit()
+    if is_product_profile() or not sample_or_demo_enabled():
         raise HTTPException(403, "デモモードは無効です")
     sample_mode = public_sample_mode_enabled()
     with connect() as db:
@@ -1346,6 +1555,8 @@ def demo_accounts(request: Request):
 
 @app.post("/api/auth/demo-login")
 def demo_login(payload: DemoLoginInput, request: Request, response: Response):
+    if is_product_profile():
+        raise HTTPException(403, "デモモードは無効です")
     if not sample_or_demo_enabled():
         with connect() as db:
             audit(db, None, "demo.login.disabled", "security", None,
@@ -1382,12 +1593,37 @@ def demo_login(payload: DemoLoginInput, request: Request, response: Response):
 
 @app.get("/api/public-config")
 def public_config():
-    return {"demo": demo_mode_enabled(), "public_sample": public_sample_mode_enabled()}
+    if is_product_profile():
+        company_name = None
+        try:
+            with connect() as db:
+                row = db.execute(
+                    "SELECT company_name FROM company_settings WHERE tenant_id=?",
+                    (deployment_tenant_id(),),
+                ).fetchone()
+                if row and (row["company_name"] or "").strip():
+                    company_name = row["company_name"]
+        except Exception:
+            company_name = None
+        return {
+            "demo": False,
+            "public_sample": False,
+            "profile": "product",
+            "company_name": company_name,
+            "app_version": APP_VERSION,
+        }
+    return {
+        "demo": demo_mode_enabled(),
+        "public_sample": public_sample_mode_enabled(),
+        "profile": "sample",
+        "company_name": None,
+        "app_version": APP_VERSION,
+    }
 
 
 @app.post("/api/auth/guest-login")
 def guest_login(request: Request, response: Response):
-    if not public_sample_mode_enabled():
+    if is_product_profile() or not public_sample_mode_enabled():
         raise HTTPException(403, "公開サンプルモードは無効です")
     with connect() as db:
         user = db.execute(
@@ -1451,13 +1687,46 @@ def password_login(payload: PasswordLoginInput, request: Request, response: Resp
             raise HTTPException(401, "社員番号またはパスワードを確認してください")
         db.execute("UPDATE users SET failed_login_attempts=0,locked_until=NULL,last_login_at=? WHERE id=?",
                    (now, user["id"]))
-        token = create_session(db, user["id"], request)
         audit(db, user["id"], "auth.login", "user", user["id"], "パスワード認証")
-        db.commit()
         session_hours = config_value(db, "auth.session_absolute_timeout_hours")
         account = {"id": user["id"], "role": user["role"], "must_change_password": bool(user["must_change_password"])}
+        recovery_flow = False
+        if user["mfa_reset_pending"]:
+            grant_token = (payload.recovery_grant or "").strip()
+            grant_row = None
+            if grant_token:
+                grant_row = db.execute(
+                    "SELECT * FROM mfa_recovery_grants WHERE token_hash=? FOR UPDATE",
+                    (hashlib.sha256(grant_token.encode("utf-8")).hexdigest(),),
+                ).fetchone()
+            if (not grant_row or grant_row["user_id"] != user["id"] or grant_row["consumed_at"]
+                    or grant_row["invalidated_at"] or grant_row["expires_at"] <= now
+                    or int(grant_row["auth_epoch"]) != int(user["auth_epoch"])):
+                db.commit()
+                raise HTTPException(401, "回復認可（グラント）が必要です")
+            cur = db.execute(
+                """UPDATE mfa_recovery_grants SET consumed_at=? WHERE id=? AND consumed_at IS NULL
+                   AND invalidated_at IS NULL AND expires_at>?""",
+                (now, grant_row["id"], now),
+            )
+            if cur.rowcount != 1:
+                db.commit()
+                raise HTTPException(401, "回復認可（グラント）は既に使用されています")
+            recovery_flow = True
+            audit(db, user["id"], "auth.mfa_recovery_grant_consumed", "user", user["id"], "回復認可の消費")
+        stage = _auth_pipeline_stage(db, user, recovery_flow=recovery_flow)
+        if stage == "GRANT_REQUIRED":
+            db.commit()
+            raise HTTPException(401, "回復認可（グラント）が必要です")
+        if stage == "MFA_CHALLENGE":
+            challenge_token = _create_login_challenge(db, user, request)
+            db.commit()
+            return {"ok": True, "mfa_required": True, "challenge": challenge_token,
+                    "challenge_expires_in_seconds": 300, "account": account}
+        token = create_session(db, user["id"], request, auth_stage=stage, recovery_flow=recovery_flow)
+        db.commit()
     set_session_cookie(request, response, token, session_hours)
-    return {"ok": True, "account": account}
+    return {"ok": True, "account": account, "auth_stage": stage}
 
 
 @app.post("/api/auth/logout")
@@ -1473,7 +1742,9 @@ def logout(request: Request, response: Response):
                 db.execute("UPDATE auth_sessions SET revoked_at=? WHERE token_hash=?",
                            (now_jst(), token_digest(token)))
                 audit(db, row["user_id"], "auth.logout", "user", row["user_id"], "ログアウト")
-    response.delete_cookie(SESSION_COOKIE, path="/", httponly=True, samesite="lax")
+    response.delete_cookie(
+        SESSION_COOKIE, path="/", httponly=True, secure=_cookie_secure(request), samesite="lax"
+    )
     return {"ok": True}
 
 
@@ -1538,7 +1809,7 @@ def complete_password_reset(payload: PasswordResetCompleteInput):
 
 
 @app.post("/api/auth/change-password")
-def change_password(payload: ChangePasswordInput, request: Request,
+def change_password(payload: ChangePasswordInput, request: Request, response: Response,
                     actor: CurrentActor = Depends(require_actor)):
     with connect() as db:
         user = db.execute("SELECT password_hash,must_change_password FROM users WHERE id=? FOR UPDATE",
@@ -1562,12 +1833,855 @@ def change_password(payload: ChangePasswordInput, request: Request,
                    (actor.user_id, user["password_hash"], now))
         db.execute("UPDATE users SET password_hash=?,must_change_password=0,password_changed_at=? WHERE id=?",
                    (encoded, now, actor.user_id))
-        token = request.cookies.get(SESSION_COOKIE)
-        if token:
-            db.execute("DELETE FROM auth_sessions WHERE user_id=? AND token_hash<>?",
-                       (actor.user_id, token_digest(token)))
+        # Spec 4.8: password change bumps auth_epoch; all sessions revoked and
+        # the pipeline re-issues the next-stage session (spec 4.4).
+        old_session = _session_row(db, request)
+        recovery_flow = bool(old_session["recovery_flow"]) if old_session else False
+        _bump_auth_epoch(db, actor.user_id)
+        _revoke_all_sessions(db, actor.user_id)
         audit(db, actor.user_id, "auth.password_changed", "user", actor.user_id, "本人によるパスワード変更")
+        fresh = db.execute("SELECT * FROM users WHERE id=?", (actor.user_id,)).fetchone()
+        if fresh["mfa_reset_pending"] and recovery_flow:
+            next_stage = "MFA_ENROLLMENT_REQUIRED"
+        elif _mfa_is_mandatory(db, fresh) and not fresh["totp_enabled"]:
+            next_stage = "MFA_ENROLLMENT_REQUIRED"
+        else:
+            next_stage = "FULL"
+        new_token = create_session(db, actor.user_id, request, auth_stage=next_stage,
+                                   recovery_flow=recovery_flow)
+        hours = config_value(db, "auth.session_absolute_timeout_hours")
+        db.commit()
+    set_session_cookie(request, response, new_token, hours)
+    return {"ok": True, "auth_stage": next_stage}
+
+
+
+
+# ================= G1-01 Seg2: MFA (TOTP) + company settings =================
+import base64
+import struct
+
+from backend import totp as _totp
+
+MFA_MANDATORY_BASE_ROLES = {"executive", "hq_finance", "manager"}
+STEP_UP_TTL_MINUTES = 10
+
+
+def _normalized_role(role) -> str:
+    return ACCOUNT_ROLES.get(role, role)
+
+
+def _mfa_fernet():
+    raw = os.getenv("MFA_ENCRYPTION_KEY", "").strip()
+    if not raw:
+        return None
+    try:
+        return Fernet(raw.encode("utf-8"))
+    except Exception:
+        return None
+
+
+def _mfa_require_fernet():
+    fernet = _mfa_fernet()
+    if fernet is None:
+        raise HTTPException(503, "MFAは現在利用できません（暗号鍵が未設定です）")
+    return fernet
+
+
+def _mfa_encrypt(fernet, plaintext: str) -> str:
+    return fernet.encrypt(plaintext.encode("utf-8")).decode("ascii")
+
+
+def _mfa_decrypt(fernet, ciphertext: str) -> str:
+    return fernet.decrypt(ciphertext.encode("utf-8")).decode("utf-8")
+
+
+def _mfa_required_roles(db) -> set:
+    roles = set(MFA_MANDATORY_BASE_ROLES)
+    row = db.execute(
+        "SELECT value_json FROM system_configs WHERE config_key=?", ("auth.mfa_required_roles",)
+    ).fetchone()
+    if row:
+        try:
+            extra = json.loads(row["value_json"]) if isinstance(row["value_json"], str) else row["value_json"]
+            for item in extra or []:
+                roles.add(_normalized_role(str(item)))
+        except (ValueError, TypeError):
+            pass
+    return roles
+
+
+def _mfa_is_mandatory(db, user) -> bool:
+    if deployment_profile() != "product":
+        return False
+    return _normalized_role(user["role"]) in _mfa_required_roles(db)
+
+
+def _set_mfa_required_roles(db, roles):
+    """Append-only role policy change: same transaction bumps policy_epoch (spec 4.5)."""
+    current = _mfa_required_roles(db)
+    merged = sorted(current | {_normalized_role(str(r)) for r in roles})
+    now_iso = now_jst().isoformat(timespec="seconds")
+    db.execute(
+        """INSERT INTO system_configs(config_key,value_json,updated_at) VALUES(?,?,?)
+           ON DUPLICATE KEY UPDATE value_json=VALUES(value_json),updated_at=VALUES(updated_at)""",
+        ("auth.mfa_required_roles", json.dumps(merged), now_iso),
+    )
+    epoch = get_policy_epoch(db) + 1
+    db.execute(
+        """INSERT INTO system_configs(config_key,value_json,updated_at) VALUES(?,?,?)
+           ON DUPLICATE KEY UPDATE value_json=VALUES(value_json),updated_at=VALUES(updated_at)""",
+        ("auth.policy_epoch", json.dumps(epoch), now_iso),
+    )
+    return merged
+
+
+def _auth_pipeline_stage(db, user, recovery_flow: bool = False) -> str:
+    """Spec 4.3 pipeline. Returns MFA_CHALLENGE / GRANT_REQUIRED /
+    PASSWORD_CHANGE_REQUIRED / MFA_ENROLLMENT_REQUIRED / FULL."""
+    if user["totp_enabled"]:
+        return "MFA_CHALLENGE"
+    if user["mfa_reset_pending"] and not recovery_flow:
+        return "GRANT_REQUIRED"
+    if user["must_change_password"]:
+        return "PASSWORD_CHANGE_REQUIRED"
+    if user["mfa_reset_pending"] and recovery_flow:
+        return "MFA_ENROLLMENT_REQUIRED"
+    if _mfa_is_mandatory(db, user):
+        return "MFA_ENROLLMENT_REQUIRED"
+    return "FULL"
+
+
+def _issue_session(db, request, response, user, recovery_flow: bool = False):
+    """Issue the session for the pipeline stage; returns (stage, token|None)."""
+    stage = _auth_pipeline_stage(db, user, recovery_flow=recovery_flow)
+    if stage in ("MFA_CHALLENGE", "GRANT_REQUIRED"):
+        return stage, None
+    token = create_session(db, user["id"], request, auth_stage=stage,
+                           recovery_flow=recovery_flow)
+    hours = config_value(db, "auth.session_absolute_timeout_hours")
+    set_session_cookie(request, response, token, hours)
+    return stage, token
+
+
+def _create_login_challenge(db, user, request) -> str:
+    now = now_jst()
+    db.execute(
+        "UPDATE auth_mfa_challenges SET invalidated_at=? WHERE user_id=? AND consumed_at IS NULL AND invalidated_at IS NULL",
+        (now, user["id"]),
+    )
+    token = secrets.token_urlsafe(32)
+    challenge_id = str(uuid.uuid4())
+    db.execute(
+        """INSERT INTO auth_mfa_challenges(id,user_id,token_hash,purpose,auth_epoch,policy_epoch,
+           created_at,expires_at,failed_attempts,source_ip) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (challenge_id, user["id"], token_digest(token), "login", int(user["auth_epoch"]),
+         get_policy_epoch(db), now, now + timedelta(minutes=5), 0,
+         request.client.host if request.client else None),
+    )
+    return token
+
+
+def _consume_totp_step(db, user_id: int, step: int) -> bool:
+    """Atomic replay guard (spec 4.2): strictly-greater step consumption."""
+    cur = db.execute(
+        "UPDATE users SET totp_last_step=? WHERE id=? AND (totp_last_step IS NULL OR totp_last_step<?)",
+        (step, user_id, step),
+    )
+    return cur.rowcount == 1
+
+
+def _hash_recovery_code(code: str) -> str:
+    normalized = "".join(str(code).split()).replace("-", "").upper()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _generate_recovery_codes(db, user_id: int):
+    now = now_jst()
+    db.execute("DELETE FROM user_recovery_codes WHERE user_id=?", (user_id,))
+    plain = []
+    for _ in range(10):
+        raw = base64.b32encode(secrets.token_bytes(16)).decode("ascii").rstrip("=")
+        grouped = "-".join(raw[i:i + 4] for i in range(0, len(raw), 4))
+        db.execute(
+            "INSERT INTO user_recovery_codes(user_id,code_hash,created_at) VALUES(?,?,?)",
+            (user_id, _hash_recovery_code(raw), now),
+        )
+        plain.append(grouped)
+    return plain
+
+
+def _consume_recovery_code(db, user_id: int, code: str) -> bool:
+    cur = db.execute(
+        "UPDATE user_recovery_codes SET used_at=? WHERE user_id=? AND code_hash=? AND used_at IS NULL",
+        (now_jst(), user_id, _hash_recovery_code(code)),
+    )
+    return cur.rowcount == 1
+
+
+def _verify_totp_or_recovery(db, user, code: str, timestamp=None) -> bool:
+    """Verify against the CURRENT secret (atomic step consumption) or a recovery code."""
+    fernet = _mfa_fernet()
+    if fernet is None or not user["totp_secret_enc"]:
+        return False
+    try:
+        secret = _mfa_decrypt(fernet, user["totp_secret_enc"])
+    except InvalidToken:
+        return False
+    step = _totp.verify(secret, code, timestamp=timestamp)
+    if step is not None:
+        return _consume_totp_step(db, user["id"], step)
+    return _consume_recovery_code(db, user["id"], code)
+
+
+def _session_row(db, request):
+    token = request.cookies.get(SESSION_COOKIE)
+    if not token:
+        return None
+    return db.execute(
+        """SELECT s.id AS session_id,s.auth_stage,s.step_up_at,s.recovery_flow,
+                  s.auth_epoch AS session_auth_epoch,s.policy_epoch AS session_policy_epoch
+           FROM auth_sessions s WHERE s.token_hash=? AND s.revoked_at IS NULL""",
+        (token_digest(token),),
+    ).fetchone()
+
+
+def _step_up_valid(session_row) -> bool:
+    if not session_row or not session_row["step_up_at"]:
+        return False
+    return session_row["step_up_at"] > now_jst() - timedelta(minutes=STEP_UP_TTL_MINUTES)
+
+
+def _revoke_all_sessions(db, user_id: int):
+    db.execute("UPDATE auth_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
+               (now_jst(), user_id))
+
+
+def _bump_auth_epoch(db, user_id: int) -> int:
+    db.execute("UPDATE users SET auth_epoch=auth_epoch+1 WHERE id=?", (user_id,))
+    row = db.execute("SELECT auth_epoch FROM users WHERE id=?", (user_id,)).fetchone()
+    return int(row["auth_epoch"])
+
+
+def _reset_user_mfa(db, target_id: int):
+    """Shared reset set (spec 4.6/4.7): clear TOTP, codes, pending, challenges,
+    sessions; bump epoch; set mfa_reset_pending; issue one recovery grant.
+    Returns the grant plaintext (shown exactly once)."""
+    now = now_jst()
+    db.execute(
+        "UPDATE users SET totp_secret_enc=NULL,totp_enabled=0,totp_confirmed_at=NULL,"
+        "totp_last_step=NULL,mfa_reset_pending=1 WHERE id=?",
+        (target_id,),
+    )
+    _bump_auth_epoch(db, target_id)
+    db.execute("DELETE FROM user_recovery_codes WHERE user_id=?", (target_id,))
+    db.execute(
+        "UPDATE mfa_enrollments SET invalidated_at=? WHERE user_id=? AND consumed_at IS NULL AND invalidated_at IS NULL",
+        (now, target_id),
+    )
+    db.execute(
+        "UPDATE auth_mfa_challenges SET invalidated_at=? WHERE user_id=? AND consumed_at IS NULL AND invalidated_at IS NULL",
+        (now, target_id),
+    )
+    db.execute(
+        "UPDATE mfa_recovery_grants SET invalidated_at=? WHERE user_id=? AND consumed_at IS NULL AND invalidated_at IS NULL",
+        (now, target_id),
+    )
+    _revoke_all_sessions(db, target_id)
+    user = db.execute("SELECT auth_epoch FROM users WHERE id=?", (target_id,)).fetchone()
+    grant = base64.b32encode(secrets.token_bytes(16)).decode("ascii").rstrip("=")
+    db.execute(
+        """INSERT INTO mfa_recovery_grants(id,user_id,token_hash,auth_epoch,created_by,created_at,expires_at)
+           VALUES(?,?,?,?,?,?,?)""",
+        (str(uuid.uuid4()), target_id, hashlib.sha256(grant.encode("utf-8")).hexdigest(),
+         int(user["auth_epoch"]), "admin-reset", now, now + timedelta(hours=48)),
+    )
+    return grant
+
+
+class MfaVerifyInput(BaseModel):
+    challenge: str
+    code: str
+
+
+class MfaConfirmInput(BaseModel):
+    enrollment_token: str
+    code: str
+
+
+class MfaDisableInput(BaseModel):
+    password: str
+    code: str
+
+
+class StepUpInput(BaseModel):
+    password: str
+    code: Optional[str] = None
+
+
+class MfaAdminResetInput(BaseModel):
+    reason: str
+
+
+@app.get("/api/auth/mfa/status")
+def mfa_status(actor: CurrentActor = Depends(require_actor)):
+    with connect() as db:
+        user = db.execute(
+            "SELECT totp_enabled,mfa_reset_pending,role FROM users WHERE id=?", (actor.user_id,)
+        ).fetchone()
+        session = None
+        return {
+            "totp_enabled": bool(user["totp_enabled"]),
+            "mfa_reset_pending": bool(user["mfa_reset_pending"]),
+            "mandatory": _mfa_is_mandatory(db, user),
+            "mfa_configured": _mfa_fernet() is not None,
+        }
+
+
+@app.post("/api/auth/mfa/verify")
+def mfa_verify(payload: MfaVerifyInput, request: Request, response: Response):
+    now = now_jst()
+    with connect() as db:
+        challenge = db.execute(
+            "SELECT * FROM auth_mfa_challenges WHERE token_hash=? FOR UPDATE",
+            (token_digest(payload.challenge),),
+        ).fetchone()
+        if (not challenge or challenge["consumed_at"] or challenge["invalidated_at"]
+                or challenge["expires_at"] <= now):
+            raise HTTPException(401, "チャレンジが無効か期限切れです")
+        user = db.execute("SELECT * FROM users WHERE id=? FOR UPDATE", (challenge["user_id"],)).fetchone()
+        if (not user or user["account_status"] != "ACTIVE"
+                or int(challenge["auth_epoch"]) != int(user["auth_epoch"])
+                or int(challenge["policy_epoch"]) != get_policy_epoch(db)):
+            db.execute("UPDATE auth_mfa_challenges SET invalidated_at=? WHERE id=?", (now, challenge["id"]))
+            raise HTTPException(401, "チャレンジが無効です")
+        if not _verify_totp_or_recovery(db, user, payload.code):
+            attempts = int(challenge["failed_attempts"]) + 1
+            db.execute(
+                "UPDATE auth_mfa_challenges SET failed_attempts=? WHERE id=?", (attempts, challenge["id"]))
+            db.execute(
+                "INSERT INTO auth_login_attempts(identity_hash,source_ip,attempted_at,succeeded) VALUES(?,?,?,0)",
+                (hashlib.sha256((user["employee_code"] or "").encode("utf-8")).hexdigest(),
+                 request.client.host if request.client else None, now),
+            )
+            if attempts >= 5:
+                db.execute("UPDATE auth_mfa_challenges SET invalidated_at=? WHERE id=?",
+                           (now, challenge["id"]))
+            db.commit()
+            raise HTTPException(401, "認証コードが正しくありません")
+        cur = db.execute(
+            "UPDATE auth_mfa_challenges SET consumed_at=? WHERE id=? AND consumed_at IS NULL AND invalidated_at IS NULL",
+            (now, challenge["id"]),
+        )
+        if cur.rowcount != 1:
+            raise HTTPException(401, "チャレンジは既に使用されています")
+        audit(db, user["id"], "auth.mfa_verified", "user", user["id"], "MFA二段認証")
+        user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+        # Pipeline re-evaluation: MFA done -> next stage (never straight to FULL
+        # unless every condition holds, spec 4.3 / MFA-25).
+        if user["must_change_password"]:
+            stage = "PASSWORD_CHANGE_REQUIRED"
+        elif _mfa_is_mandatory(db, user) and not user["totp_enabled"]:
+            stage = "MFA_ENROLLMENT_REQUIRED"
+        else:
+            stage = "FULL"
+        token = create_session(db, user["id"], request, auth_stage=stage)
+        db.commit()
+        hours = config_value(db, "auth.session_absolute_timeout_hours")
+    set_session_cookie(request, response, token, hours)
+    return {"ok": True, "auth_stage": stage}
+
+
+@app.post("/api/auth/step-up")
+def step_up(payload: StepUpInput, request: Request, actor: CurrentActor = Depends(require_actor)):
+    with connect() as db:
+        user = db.execute("SELECT * FROM users WHERE id=?", (actor.user_id,)).fetchone()
+        if not user or not user["password_hash"] or not verify_secret(payload.password, user["password_hash"]):
+            raise HTTPException(401, "パスワードが正しくありません")
+        if user["totp_enabled"]:
+            if not payload.code or not _verify_totp_or_recovery(db, user, payload.code):
+                raise HTTPException(401, "認証コードが正しくありません")
+        session = _session_row(db, request)
+        if not session:
+            raise HTTPException(401, "認証が必要です")
+        db.execute("UPDATE auth_sessions SET step_up_at=? WHERE id=?", (now_jst(), session["session_id"]))
+        audit(db, actor.user_id, "auth.step_up", "user", actor.user_id, "ステップアップ認証")
+    return {"ok": True, "valid_minutes": STEP_UP_TTL_MINUTES}
+
+
+@app.post("/api/auth/mfa/setup")
+def mfa_setup(request: Request, actor: CurrentActor = Depends(require_actor)):
+    fernet = _mfa_require_fernet()
+    with connect() as db:
+        user = db.execute("SELECT * FROM users WHERE id=?", (actor.user_id,)).fetchone()
+        session = _session_row(db, request)
+        if user["totp_enabled"]:
+            # Replacement flow: current-TOTP step-up required first (spec 4.3).
+            if not _step_up_valid(session):
+                raise HTTPException(403, "認証器の変更にはステップアップ認証が必要です")
+        now = now_jst()
+        db.execute(
+            "UPDATE mfa_enrollments SET invalidated_at=? WHERE user_id=? AND consumed_at IS NULL AND invalidated_at IS NULL",
+            (now, actor.user_id),
+        )
+        secret = _totp.generate_secret()
+        ensure_mfa_key_check(db, os.getenv("MFA_ENCRYPTION_KEY", "").strip())
+        enrollment_token = secrets.token_urlsafe(32)
+        enrollment_id = str(uuid.uuid4())
+        db.execute(
+            """INSERT INTO mfa_enrollments(id,user_id,pending_secret_enc,token_hash,initiating_session_id,
+               created_at,expires_at) VALUES(?,?,?,?,?,?,?)""",
+            (enrollment_id, actor.user_id, _mfa_encrypt(fernet, secret), token_digest(enrollment_token),
+             session["session_id"] if session else None, now, now + timedelta(minutes=10)),
+        )
+        audit(db, actor.user_id, "auth.mfa_setup_started", "user", actor.user_id, "MFA登録開始")
+        account = user["employee_code"] or f"user-{actor.user_id}"
+    return {
+        "enrollment_token": enrollment_token,
+        "secret": secret,
+        "otpauth_uri": _totp.otpauth_uri(secret, account, "SumaiBoard"),
+        "expires_in_seconds": 600,
+    }
+
+
+@app.post("/api/auth/mfa/confirm")
+def mfa_confirm(payload: MfaConfirmInput, request: Request, response: Response,
+                actor: CurrentActor = Depends(require_actor)):
+    fernet = _mfa_require_fernet()
+    now = now_jst()
+    with connect() as db:
+        enrollment = db.execute(
+            "SELECT * FROM mfa_enrollments WHERE token_hash=? FOR UPDATE",
+            (token_digest(payload.enrollment_token),),
+        ).fetchone()
+        session = _session_row(db, request)
+        if (not enrollment or enrollment["user_id"] != actor.user_id
+                or enrollment["consumed_at"] or enrollment["invalidated_at"]
+                or enrollment["expires_at"] <= now
+                or not session or enrollment["initiating_session_id"] != session["session_id"]):
+            raise HTTPException(400, "登録セッションが無効か期限切れです")
+        pending_secret = _mfa_decrypt(fernet, enrollment["pending_secret_enc"])
+        step = _totp.verify(pending_secret, payload.code)
+        if step is None:
+            raise HTTPException(401, "認証コードが正しくありません")
+        # Atomic one-time consumption of the enrollment itself (spec 4.2 R16-R1).
+        cur = db.execute(
+            """UPDATE mfa_enrollments SET consumed_at=? WHERE id=? AND consumed_at IS NULL
+               AND invalidated_at IS NULL AND expires_at>?""",
+            (now, enrollment["id"], now),
+        )
+        if cur.rowcount != 1:
+            raise HTTPException(400, "登録セッションは既に使用されています")
+        was_recovery = bool(session["recovery_flow"])
+        db.execute(
+            """UPDATE users SET totp_secret_enc=?,totp_enabled=1,totp_confirmed_at=?,
+               totp_last_step=?,mfa_reset_pending=0 WHERE id=?""",
+            (_mfa_encrypt(fernet, pending_secret), now, step, actor.user_id),
+        )
+        codes = _generate_recovery_codes(db, actor.user_id)
+        _bump_auth_epoch(db, actor.user_id)
+        _revoke_all_sessions(db, actor.user_id)
+        audit(db, actor.user_id, "auth.mfa_enabled", "user", actor.user_id, "MFA登録完了")
+        user = db.execute("SELECT * FROM users WHERE id=?", (actor.user_id,)).fetchone()
+        # Enrollment just completed: pipeline re-evaluation (spec 4.4) - only a
+        # pending forced password change can remain before FULL.
+        stage = "PASSWORD_CHANGE_REQUIRED" if user["must_change_password"] else "FULL"
+        token = create_session(db, actor.user_id, request, auth_stage=stage)
+        hours = config_value(db, "auth.session_absolute_timeout_hours")
+        set_session_cookie(request, response, token, hours)
+        db.commit()
+    response.headers["Cache-Control"] = "no-store"
+    return {"ok": True, "auth_stage": stage, "recovery_codes": codes,
+            "recovery_flow_completed": was_recovery}
+
+
+@app.post("/api/auth/mfa/disable")
+def mfa_disable(payload: MfaDisableInput, request: Request,
+                actor: CurrentActor = Depends(require_actor)):
+    with connect() as db:
+        user = db.execute("SELECT * FROM users WHERE id=?", (actor.user_id,)).fetchone()
+        if _mfa_is_mandatory(db, user):
+            raise HTTPException(403, "必須ロールではMFAを解除できません")
+        if not user["password_hash"] or not verify_secret(payload.password, user["password_hash"]):
+            raise HTTPException(401, "パスワードが正しくありません")
+        if not user["totp_enabled"] or not _verify_totp_or_recovery(db, user, payload.code):
+            raise HTTPException(401, "認証コードが正しくありません")
+        db.execute(
+            "UPDATE users SET totp_secret_enc=NULL,totp_enabled=0,totp_confirmed_at=NULL,totp_last_step=NULL WHERE id=?",
+            (actor.user_id,),
+        )
+        db.execute("DELETE FROM user_recovery_codes WHERE user_id=?", (actor.user_id,))
+        _bump_auth_epoch(db, actor.user_id)
+        _revoke_all_sessions(db, actor.user_id)
+        audit(db, actor.user_id, "auth.mfa_disabled", "user", actor.user_id, "MFA解除")
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(SESSION_COOKIE, path="/", httponly=True, samesite="lax")
+    return response
+
+
+@app.post("/api/auth/mfa/recovery-codes/regenerate")
+def mfa_recovery_regenerate(request: Request, actor: CurrentActor = Depends(require_actor)):
+    with connect() as db:
+        user = db.execute("SELECT * FROM users WHERE id=?", (actor.user_id,)).fetchone()
+        session = _session_row(db, request)
+        if not user["totp_enabled"]:
+            raise HTTPException(400, "MFAが有効ではありません")
+        if not _step_up_valid(session):
+            raise HTTPException(403, "回復コードの再発行にはステップアップ認証が必要です")
+        codes = _generate_recovery_codes(db, actor.user_id)
+        audit(db, actor.user_id, "auth.mfa_recovery_regenerated", "user", actor.user_id, "回復コード再発行")
+    response = JSONResponse({"ok": True, "recovery_codes": codes})
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.post("/api/accounts/{user_id}/mfa/reset")
+def mfa_admin_reset(user_id: int, payload: MfaAdminResetInput, request: Request,
+                    actor: CurrentActor = Depends(require_actor)):
+    reason = (payload.reason or "").strip()
+    if not (10 <= len(reason) <= 500):
+        raise HTTPException(422, "リセット理由は10〜500文字で入力してください")
+    if user_id == actor.user_id:
+        raise HTTPException(403, "自分自身のMFAはリセットできません")
+    with connect() as db:
+        if _normalized_role(actor.account_role) != "executive":
+            raise HTTPException(403, "この操作を行う権限がありません")
+        session = _session_row(db, request)
+        if not _step_up_valid(session):
+            raise HTTPException(403, "管理者リセットには直近のステップアップ認証が必要です")
+        target = db.execute("SELECT id,role FROM users WHERE id=?", (user_id,)).fetchone()
+        if not target:
+            raise HTTPException(404, "対象アカウントが見つかりません")
+        grant = _reset_user_mfa(db, user_id)
+        audit(db, actor.user_id, "security.alert", "user", user_id,
+              json.dumps({"kind": "mfa_admin_reset", "reason": reason}, ensure_ascii=False))
+    response = JSONResponse({"ok": True, "recovery_grant": grant, "grant_expires_hours": 48})
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+# ---------- Company settings (spec section 3) ----------
+COMPANY_BANK_FIELDS = ("bank_name", "bank_branch", "account_type", "account_number", "account_holder")
+COMPANY_BASIC_FIELDS = ("company_name", "postal_code", "address", "phone", "fax", "email",
+                        "representative_name", "registration_number")
+COMPANY_FISCAL_FIELDS = ("fiscal_year_start_month", "closing_day", "default_payout_day")
+
+
+def _attachment_root() -> Path:
+    raw = os.getenv("ATTACHMENT_STORAGE_DIR", "").strip()
+    if not raw:
+        raise HTTPException(503, "添付ストレージが未設定です")
+    return Path(raw)
+
+
+def _company_row(db):
+    tenant_id = deployment_tenant_id()
+    row = db.execute("SELECT * FROM company_settings WHERE tenant_id=?", (tenant_id,)).fetchone()
+    if not row:
+        db.execute(
+            "INSERT IGNORE INTO company_settings(tenant_id,created_at,updated_at) VALUES(?,?,?)",
+            (tenant_id, now_jst(), now_jst()),
+        )
+        row = db.execute("SELECT * FROM company_settings WHERE tenant_id=?", (tenant_id,)).fetchone()
+    return row
+
+
+def _company_view(db, actor):
+    row = _company_row(db)
+    role = _normalized_role(actor.account_role)
+    view = {"configured": bool((row["company_name"] or "").strip()), "version": row["version"]}
+    for field in COMPANY_BASIC_FIELDS:
+        view[field] = row[field]
+    view["logo_url"] = "/api/company-settings/logo" if row["logo_file_key"] else None
+    if role in ("executive", "hq_finance"):
+        for field in COMPANY_FISCAL_FIELDS:
+            view[field] = row[field]
+        bank = {f: row[f] for f in COMPANY_BANK_FIELDS if f != "account_number"}
+        acct = row["account_number"] or ""
+        bank["account_number_masked"] = ("*****" + acct[-2:]) if acct else None
+        view["bank"] = bank
+    return view
+
+
+def _validate_company_payload(payload: dict, fields):
+    errors = {}
+    reg = payload.get("registration_number")
+    if "registration_number" in fields and reg:
+        if not re.fullmatch(r"T\d{13}", str(reg).strip()):
+            errors["registration_number"] = "法人番号はT+13桁で入力してください"
+    for field, lo, hi in (("fiscal_year_start_month", 1, 12), ("closing_day", 1, 31),
+                          ("default_payout_day", 1, 31)):
+        if field in fields and payload.get(field) is not None:
+            value = payload[field]
+            if not isinstance(value, int) or not (lo <= value <= hi):
+                errors[field] = f"{lo}〜{hi}の範囲で入力してください"
+    if "company_name" in fields:
+        name = str(payload.get("company_name") or "").strip()
+        if not name:
+            errors["company_name"] = "会社名は必須です"
+        elif len(name) > 160:
+            errors["company_name"] = "会社名が長すぎます"
+    return errors
+
+
+class CompanySettingsInput(BaseModel):
+    version: int
+    company_name: Optional[str] = None
+    postal_code: Optional[str] = None
+    address: Optional[str] = None
+    phone: Optional[str] = None
+    fax: Optional[str] = None
+    email: Optional[str] = None
+    representative_name: Optional[str] = None
+    registration_number: Optional[str] = None
+    fiscal_year_start_month: Optional[int] = None
+    closing_day: Optional[int] = None
+    default_payout_day: Optional[int] = None
+    bank_name: Optional[str] = None
+    bank_branch: Optional[str] = None
+    account_type: Optional[str] = None
+    account_number: Optional[str] = None
+    account_holder: Optional[str] = None
+
+
+class BankAccountInput(BaseModel):
+    version: int
+    account_number_op: str
+    bank_name: Optional[str] = None
+    bank_branch: Optional[str] = None
+    account_type: Optional[str] = None
+    account_number: Optional[str] = None
+    account_holder: Optional[str] = None
+
+
+@app.get("/api/company-settings")
+def company_settings_get(actor: CurrentActor = Depends(require_actor)):
+    if _normalized_role(actor.account_role) == "owner":
+        raise HTTPException(403, "オーナーアカウントからこの操作はできません")
+    with connect() as db:
+        return _company_view(db, actor)
+
+
+@app.put("/api/company-settings")
+def company_settings_put(payload: CompanySettingsInput, request: Request,
+                         actor: CurrentActor = Depends(require_actor)):
+    if _normalized_role(actor.account_role) != "executive":
+        raise HTTPException(403, "会社設定の変更は executive のみ可能です")
+    body = payload.dict()
+    if any(body.get(f) is not None for f in COMPANY_BANK_FIELDS):
+        raise HTTPException(422, "銀行口座フィールドは専用エンドポイントで変更してください")
+    fields = COMPANY_BASIC_FIELDS + COMPANY_FISCAL_FIELDS
+    errors = _validate_company_payload(body, fields)
+    if errors:
+        raise HTTPException(422, json.dumps(errors, ensure_ascii=False))
+    with connect() as db:
+        row = _company_row(db)
+        before_hash = hashlib.sha256(json.dumps(
+            {f: row[f] for f in fields}, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
+        sets = ", ".join(f"{f}=?" for f in fields)
+        cur = db.execute(
+            f"UPDATE company_settings SET {sets}, version=version+1, updated_at=? WHERE tenant_id=? AND version=?",
+            tuple((str(body[f]).strip() if isinstance(body.get(f), str) else body.get(f)) for f in fields)
+            + (now_jst(), deployment_tenant_id(), payload.version),
+        )
+        if cur.rowcount != 1:
+            raise HTTPException(409, "他のユーザーが先に更新しました。再読み込みしてください")
+        row = _company_row(db)
+        after_hash = hashlib.sha256(json.dumps(
+            {f: row[f] for f in fields}, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
+        audit(db, actor.user_id, "company_settings.updated", "company_settings", deployment_tenant_id(),
+              json.dumps({"before_hash": before_hash, "after_hash": after_hash}, ensure_ascii=False))
+        return _company_view(db, actor)
+
+
+@app.put("/api/company-settings/bank-account")
+def company_bank_put(payload: BankAccountInput, request: Request,
+                     actor: CurrentActor = Depends(require_actor)):
+    if _normalized_role(actor.account_role) != "executive":
+        raise HTTPException(403, "銀行口座の変更は executive のみ可能です")
+    if payload.account_number_op not in ("keep", "set", "clear"):
+        raise HTTPException(422, "account_number_op が不正です")
+    with connect() as db:
+        session = _session_row(db, request)
+        if not _step_up_valid(session):
+            raise HTTPException(403, "銀行口座の変更にはステップアップ認証が必要です")
+        row = _company_row(db)
+        old_masked = ("*****" + row["account_number"][-2:]) if row["account_number"] else None
+        new_number = row["account_number"]
+        if payload.account_number_op == "set":
+            new_number = str(payload.account_number or "").strip()
+            if not re.fullmatch(r"\d{1,7}", new_number or ""):
+                raise HTTPException(422, "口座番号は数字7桁以内で入力してください")
+        elif payload.account_number_op == "clear":
+            new_number = None
+        cur = db.execute(
+            """UPDATE company_settings SET bank_name=?,bank_branch=?,account_type=?,account_number=?,
+               account_holder=?, version=version+1, updated_at=? WHERE tenant_id=? AND version=?""",
+            (payload.bank_name, payload.bank_branch, payload.account_type, new_number,
+             payload.account_holder, now_jst(), deployment_tenant_id(), payload.version),
+        )
+        if cur.rowcount != 1:
+            raise HTTPException(409, "他のユーザーが先に更新しました。再読み込みしてください")
+        new_masked = ("*****" + new_number[-2:]) if new_number else None
+        audit(db, actor.user_id, "company_settings.bank_updated", "company_settings",
+              deployment_tenant_id(),
+              json.dumps({"op": payload.account_number_op, "before_masked": old_masked,
+                          "after_masked": new_masked}, ensure_ascii=False))
+        return _company_view(db, actor)
+
+
+@app.post("/api/company-settings/bank-account/reveal")
+def company_bank_reveal(request: Request, actor: CurrentActor = Depends(require_actor)):
+    if _normalized_role(actor.account_role) not in ("executive", "hq_finance"):
+        raise HTTPException(403, "権限がありません")
+    with connect() as db:
+        session = _session_row(db, request)
+        if not _step_up_valid(session):
+            raise HTTPException(403, "口座番号の表示にはステップアップ認証が必要です")
+        row = _company_row(db)
+        audit(db, actor.user_id, "company_settings.bank_revealed", "company_settings",
+              deployment_tenant_id(), "口座番号の完全表示")
+    response = JSONResponse({"account_number": row["account_number"]})
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _parse_image_header(data: bytes):
+    """Restricted structural validation (spec 3.4 R10-R1): PNG/JPEG only.
+    Returns (ext, width, height) or raises HTTPException 422."""
+    if len(data) < 8:
+        raise HTTPException(422, "画像ファイルが不正です")
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        if len(data) < 33 or data[12:16] != b"IHDR":
+            raise HTTPException(422, "PNGヘッダが不正です")
+        width, height = struct.unpack(">II", data[16:24])
+        if data[-12:-8] != b"IEND" and b"IEND" not in data[-16:]:
+            raise HTTPException(422, "PNGが切り詰められています")
+        return "png", width, height
+    if data[:2] == b"\xff\xd8":
+        if data[-2:] != b"\xff\xd9":
+            raise HTTPException(422, "JPEGが切り詰められています")
+        idx = 2
+        while idx + 9 < len(data):
+            if data[idx] != 0xFF:
+                raise HTTPException(422, "JPEG構造が不正です")
+            marker = data[idx + 1]
+            if marker in (0xC0, 0xC1, 0xC2):
+                seglen = struct.unpack(">H", data[idx + 2:idx + 4])[0]
+                if seglen < 7 or idx + 2 + seglen > len(data):
+                    raise HTTPException(422, "JPEGセグメント長が不正です")
+                height, width = struct.unpack(">HH", data[idx + 5:idx + 9])
+                return "jpg", width, height
+            if marker == 0xDA:
+                break
+            seglen = struct.unpack(">H", data[idx + 2:idx + 4])[0]
+            if seglen < 2:
+                raise HTTPException(422, "JPEGセグメント長が不正です")
+            idx += 2 + seglen
+        raise HTTPException(422, "JPEGの寸法が取得できません")
+    raise HTTPException(422, "PNG/JPEGのみ対応しています")
+
+
+@app.post("/api/company-settings/logo")
+async def company_logo_post(request: Request, actor: CurrentActor = Depends(require_actor)):
+    if _normalized_role(actor.account_role) != "executive":
+        raise HTTPException(403, "ロゴの変更は executive のみ可能です")
+    form = await request.form()
+    upload = form.get("file")
+    if upload is None:
+        raise HTTPException(422, "ファイルが必要です")
+    data = b""
+    while True:
+        chunk = await upload.read(256 * 1024)
+        if not chunk:
+            break
+        data += chunk
+        if len(data) > 2 * 1024 * 1024:
+            raise HTTPException(422, "ロゴは2MB以内にしてください")
+    ext, width, height = _parse_image_header(data)
+    if width > 4096 or height > 4096 or width * height > 16_000_000:
+        raise HTTPException(422, "画像サイズが上限を超えています")
+    tenant_id = deployment_tenant_id()
+    now = now_jst()
+    key = f"{tenant_id}/branding/{now:%Y}/{now:%m}/{uuid.uuid4()}.{ext}"
+    root = _attachment_root()
+    target = root / key
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    if target.read_bytes() != data:
+        raise HTTPException(500, "ロゴの保存検証に失敗しました")
+    with connect() as db:
+        row = _company_row(db)
+        old_key = row["logo_file_key"]
+        version = form.get("version")
+        if version is not None:
+            cur = db.execute(
+                "UPDATE company_settings SET logo_file_key=?, version=version+1, updated_at=? WHERE tenant_id=? AND version=?",
+                (key, now, tenant_id, int(version)),
+            )
+            if cur.rowcount != 1:
+                target.unlink(missing_ok=True)
+                raise HTTPException(409, "他のユーザーが先に更新しました")
+        else:
+            db.execute(
+                "UPDATE company_settings SET logo_file_key=?, version=version+1, updated_at=? WHERE tenant_id=?",
+                (key, now, tenant_id),
+            )
+        audit(db, actor.user_id, "company_settings.logo_updated", "company_settings", tenant_id, key)
+    if old_key and old_key != key:
+        try:
+            (root / old_key).unlink(missing_ok=True)
+        except OSError:
+            pass
+    return {"ok": True, "logo_url": "/api/company-settings/logo"}
+
+
+@app.delete("/api/company-settings/logo")
+def company_logo_delete(payload_version: Optional[int] = None, version: Optional[int] = None,
+                        actor: CurrentActor = Depends(require_actor)):
+    if _normalized_role(actor.account_role) != "executive":
+        raise HTTPException(403, "ロゴの削除は executive のみ可能です")
+    tenant_id = deployment_tenant_id()
+    with connect() as db:
+        row = _company_row(db)
+        old_key = row["logo_file_key"]
+        expected = version if version is not None else payload_version
+        if expected is not None:
+            cur = db.execute(
+                "UPDATE company_settings SET logo_file_key=NULL, version=version+1, updated_at=? WHERE tenant_id=? AND version=?",
+                (now_jst(), tenant_id, expected),
+            )
+            if cur.rowcount != 1:
+                raise HTTPException(409, "他のユーザーが先に更新しました")
+        else:
+            db.execute(
+                "UPDATE company_settings SET logo_file_key=NULL, version=version+1, updated_at=? WHERE tenant_id=?",
+                (now_jst(), tenant_id),
+            )
+        audit(db, actor.user_id, "company_settings.logo_deleted", "company_settings", tenant_id, old_key or "")
+        db.commit()
+    if old_key:
+        try:
+            (_attachment_root() / old_key).unlink(missing_ok=True)
+        except OSError:
+            pass
     return {"ok": True}
+
+
+@app.get("/api/company-settings/logo")
+def company_logo_get():
+    with connect() as db:
+        row = db.execute("SELECT logo_file_key FROM company_settings WHERE tenant_id=?",
+                         (deployment_tenant_id(),)).fetchone()
+    if not row or not row["logo_file_key"]:
+        raise HTTPException(404, "ロゴは未設定です")
+    path = _attachment_root() / row["logo_file_key"]
+    if not path.is_file():
+        raise HTTPException(404, "ロゴファイルが見つかりません")
+    media = "image/png" if path.suffix == ".png" else "image/jpeg"
+    response = FileResponse(path, media_type=media)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 
 @app.get("/api/accounts")
@@ -1760,6 +2874,19 @@ def ensure_schema(db):
             "password_changed_at": "DATETIME NULL",
             "last_password_reset_at": "DATETIME NULL",
             "version": "INT NOT NULL DEFAULT 1",
+            "totp_secret_enc": "VARCHAR(512) NULL",
+            "totp_enabled": "TINYINT NOT NULL DEFAULT 0",
+            "totp_confirmed_at": "DATETIME NULL",
+            "totp_last_step": "BIGINT NULL",
+            "auth_epoch": "INT NOT NULL DEFAULT 1",
+            "mfa_reset_pending": "TINYINT NOT NULL DEFAULT 0",
+        },
+        "auth_sessions": {
+            "auth_stage": "VARCHAR(32) NOT NULL DEFAULT 'FULL'",
+            "auth_epoch": "INT NOT NULL DEFAULT 1",
+            "policy_epoch": "INT NOT NULL DEFAULT 1",
+            "step_up_at": "DATETIME NULL",
+            "recovery_flow": "TINYINT NOT NULL DEFAULT 0",
         },
         "audit_events": {
             "object_id_text": "VARCHAR(160) NULL",
@@ -1897,6 +3024,8 @@ def ensure_schema(db):
 
 
 def ensure_demo_accounts(db):
+    if is_product_profile():
+        raise RuntimeError("ensure_demo_accounts() is forbidden in product profile")
     existing = db.execute(
         "SELECT id,role,store_id,name,employee_code FROM users ORDER BY id"
     ).fetchall()
@@ -2068,11 +3197,14 @@ def demo_receipt_pdf():
     return bytes(content)
 
 
-def seed(db):
-    _seed_legacy(db)
+def seed(db, *, ensure_ddl=True):
+    if is_product_profile():
+        raise RuntimeError("seed() is forbidden in product profile")
+    _seed_legacy(db, ensure_ddl=ensure_ddl)
     ensure_system_config(db)
     ensure_demo_accounts(db)
-    rental.ensure_rental_schema(db)
+    if ensure_ddl:
+        rental.ensure_rental_schema(db)
     if public_sample_mode_enabled():
         rental.seed_rental(db)
         db.execute(
@@ -2082,8 +3214,11 @@ def seed(db):
         )
 
 
-def _seed_legacy(db):
-    ensure_schema(db)
+def _seed_legacy(db, *, ensure_ddl=True):
+    if is_product_profile():
+        raise RuntimeError("_seed_legacy() is forbidden in product profile")
+    if ensure_ddl:
+        ensure_schema(db)
     if db.execute("SELECT COUNT(*) FROM seed_metadata WHERE id=1").fetchone()[0]:
         return
     if db.execute("SELECT COUNT(*) FROM stores").fetchone()[0]:
@@ -2646,6 +3781,8 @@ def referral_reset_storage_keys(db):
 
 
 def rebuild_demo_data(db, tables, referral_storage_keys, session_token=None, audit_user_id=None):
+    if is_product_profile():
+        raise RuntimeError("rebuild_demo_data() is forbidden in product profile")
     sample_mode = public_sample_mode_enabled()
     if "system_configs" in tables:
         db.execute(
@@ -2684,24 +3821,595 @@ def sample_seed_is_complete(db, tables):
     return len(markers) == 2 and all(str(row[0]) == "1" for row in markers)
 
 
-recovering_sample = False
-for attempt in range(60):
+def _paths_overlap(path_a: Path, path_b: Path) -> bool:
+    real_a = Path(os.path.realpath(path_a))
+    real_b = Path(os.path.realpath(path_b))
+    return real_a == real_b or real_a in real_b.parents or real_b in real_a.parents
+
+
+def _mfa_key_fingerprint(raw_key: str) -> str:
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:16]
+
+
+def ensure_mfa_key_check(db, raw_key: str):
+    existing = db.execute(
+        "SELECT value_json FROM system_configs WHERE config_key=?", ("auth.mfa_key_check",)
+    ).fetchone()
+    if existing:
+        return
+    fernet = Fernet(raw_key.encode("utf-8"))
+    payload = {
+        "key_fingerprint": _mfa_key_fingerprint(raw_key),
+        "probe": fernet.encrypt(MFA_KEY_PROBE_PLAINTEXT).decode("ascii"),
+    }
+    db.execute(
+        """INSERT INTO system_configs(config_key,value_json,updated_at) VALUES(?,?,?)
+           ON DUPLICATE KEY UPDATE config_key=config_key""",
+        ("auth.mfa_key_check", json.dumps(payload, sort_keys=True), now_jst().isoformat(timespec="seconds")),
+    )
+
+
+def ensure_policy_epoch_migration(db):
+    now_iso = now_jst().isoformat(timespec="seconds")
+    db.execute(
+        "INSERT IGNORE INTO system_configs(config_key,value_json,updated_at) VALUES(?,?,?)",
+        ("auth.policy_epoch", json.dumps(1), now_iso),
+    )
+    migrated = db.execute(
+        "SELECT value_json FROM system_configs WHERE config_key=?",
+        ("auth.policy_epoch_v310_bumped",),
+    ).fetchone()
+    if migrated:
+        return
+    row = db.execute(
+        "SELECT value_json FROM system_configs WHERE config_key=? FOR UPDATE",
+        ("auth.policy_epoch",),
+    ).fetchone()
+    current_epoch = 1
+    if row:
+        val = json.loads(row["value_json"]) if isinstance(row["value_json"], str) else row["value_json"]
+        current_epoch = int(val)
+    if current_epoch < 2:
+        db.execute(
+            "UPDATE system_configs SET value_json=?,updated_at=? WHERE config_key=?",
+            (json.dumps(2), now_iso, "auth.policy_epoch"),
+        )
+    db.execute(
+        "UPDATE auth_sessions SET revoked_at=? WHERE revoked_at IS NULL",
+        (now_jst(),),
+    )
+    db.execute(
+        "INSERT INTO system_configs(config_key,value_json,updated_at) VALUES(?,?,?)",
+        ("auth.policy_epoch_v310_bumped", json.dumps(True), now_iso),
+    )
+
+
+def _verify_tenant_id_columns_only(db, expected_tenant_id: int, tables: set[str]):
+    tenant_tables = [
+        row["TABLE_NAME"]
+        for row in db.execute(
+            """SELECT TABLE_NAME FROM information_schema.COLUMNS
+               WHERE TABLE_SCHEMA=DATABASE() AND COLUMN_NAME='tenant_id'
+               ORDER BY TABLE_NAME"""
+        ).fetchall()
+    ]
+    for table in tenant_tables:
+        if table not in tables:
+            continue
+        bad = db.execute(
+            f"SELECT COUNT(*) AS cnt FROM `{table}` WHERE tenant_id IS NULL OR tenant_id <> ?",
+            (expected_tenant_id,),
+        ).fetchone()["cnt"]
+        if bad:
+            raise RuntimeError(
+                f"SC-04 tenant invariant violated in `{table}`: found {bad} row(s) with tenant_id != {expected_tenant_id}"
+            )
+    return tenant_tables
+
+
+def read_build_revision() -> str:
+    release_file = ROOT / "RELEASE.json"
+    if release_file.is_file():
+        try:
+            data = json.loads(release_file.read_text(encoding="utf-8"))
+            sha = str(data.get("sha") or "").strip()
+            if sha:
+                return sha
+        except (OSError, ValueError, TypeError):
+            pass
+    return os.getenv("BUILD_REVISION", "").strip()
+
+
+def _read_backup_status() -> dict:
+    raw = os.getenv("BACKUP_STATUS_FILE", "").strip()
+    if not raw:
+        return {
+            "configured": False,
+            "status": "not_configured",
+            "degraded": False,
+            "last_success": None,
+            "last_attempt": None,
+        }
+    target = Path(raw)
+    if target.is_dir():
+        success_path = target / "last-success.json"
+        attempt_path = target / "last-attempt.json"
+    else:
+        success_path = target
+        attempt_path = target.parent / "last-attempt.json"
+
+    def _load_json(path: Path):
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return {"_parse_error": True}
+
+    last_success = _load_json(success_path)
+    last_attempt = _load_json(attempt_path)
+    degraded = False
+    reasons = []
+    if isinstance(last_success, dict) and last_success.get("_parse_error"):
+        degraded = True
+        reasons.append("last_success_corrupt")
+    if isinstance(last_attempt, dict) and last_attempt.get("_parse_error"):
+        degraded = True
+        reasons.append("last_attempt_corrupt")
+    if isinstance(last_attempt, dict) and last_attempt.get("result") == "failure":
+        attempt_at = str(last_attempt.get("at") or "")
+        success_at = str((last_success or {}).get("completed_at") or "")
+        if not last_success or attempt_at > success_at:
+            degraded = True
+            reasons.append("last_attempt_failed")
+    if isinstance(last_attempt, dict) and last_attempt.get("offsite") == "failed":
+        degraded = True
+        reasons.append("offsite_failed")
+    overdue = False
+    if isinstance(last_success, dict) and last_success.get("completed_at"):
+        try:
+            completed_dt = datetime.fromisoformat(str(last_success["completed_at"]).replace("Z", "+00:00"))
+            now_cmp = datetime.now(completed_dt.tzinfo) if completed_dt.tzinfo else now_jst()
+            if (now_cmp - completed_dt) > timedelta(hours=26):
+                overdue = True
+                degraded = True
+                reasons.append("backup_overdue")
+        except (ValueError, TypeError):
+            degraded = True
+            reasons.append("invalid_completed_at")
+    return {
+        "configured": True,
+        "status": "degraded" if degraded else ("ok" if last_success else "pending"),
+        "degraded": degraded,
+        "overdue": overdue,
+        "reasons": reasons,
+        "last_success": last_success,
+        "last_attempt": last_attempt,
+    }
+
+
+def stage0_env_precheck():
+    global _TRUSTED_PUBLIC_ORIGIN, _PUBLIC_ORIGIN_SCHEME
+    ctx = get_deployment_context()
+
+    raw_demo = os.getenv("DEMO_MODE", "false").strip().lower()
+    raw_pub = os.getenv("PUBLIC_SAMPLE_MODE", "false").strip().lower()
+    raw_reset_tok = os.getenv("SAMPLE_RESET_TOKEN", "")
+    raw_legacy_auth = os.getenv("LEGACY_MIGRATION_AUTHORIZED", "").strip()
+
+    if raw_legacy_auth not in ("", "sample"):
+        raise RuntimeError("LEGACY_MIGRATION_AUTHORIZED must be 'sample' or empty")
+
+    if ctx.profile == "product":
+        if raw_demo not in ("", "false") or raw_pub not in ("", "false"):
+            raise RuntimeError("DEMO_MODE and PUBLIC_SAMPLE_MODE must be false in product profile")
+        if raw_reset_tok != "":
+            raise RuntimeError("SAMPLE_RESET_TOKEN must be empty in product profile")
+        if raw_legacy_auth != "":
+            raise RuntimeError("LEGACY_MIGRATION_AUTHORIZED is forbidden in product profile")
+
+    raw_origin = os.getenv("PUBLIC_ORIGIN", "").strip()
     try:
-        with connect() as db:
-            if public_sample_mode_enabled():
+        origin_tuple = parse_origin(raw_origin, allow_trailing_slash=True)
+    except ValueError as exc:
+        raise RuntimeError(f"PUBLIC_ORIGIN is required and invalid: {exc}") from exc
+    _TRUSTED_PUBLIC_ORIGIN = origin_tuple
+    _PUBLIC_ORIGIN_SCHEME = origin_tuple[0]
+
+    raw_mfa_key = os.getenv("MFA_ENCRYPTION_KEY", "").strip()
+    if ctx.profile == "product":
+        if not raw_mfa_key:
+            raise RuntimeError("MFA_ENCRYPTION_KEY is required in product profile")
+        try:
+            Fernet(raw_mfa_key.encode("utf-8"))
+        except Exception as exc:
+            raise RuntimeError("MFA_ENCRYPTION_KEY is not a valid Fernet key") from exc
+    elif raw_mfa_key:
+        try:
+            Fernet(raw_mfa_key.encode("utf-8"))
+        except Exception as exc:
+            raise RuntimeError("MFA_ENCRYPTION_KEY is not a valid Fernet key") from exc
+
+    if not REFERRAL_STORAGE_DIR.is_absolute():
+        raise RuntimeError("REFERRAL_STORAGE_DIR must be an absolute path")
+
+    attachment_dir_raw = os.getenv("ATTACHMENT_STORAGE_DIR", "").strip()
+    if attachment_dir_raw:
+        attachment_path = Path(attachment_dir_raw)
+        if not attachment_path.is_absolute():
+            raise RuntimeError("ATTACHMENT_STORAGE_DIR must be an absolute path")
+        if _paths_overlap(attachment_path, REFERRAL_STORAGE_DIR):
+            raise RuntimeError("ATTACHMENT_STORAGE_DIR must not overlap REFERRAL_STORAGE_DIR")
+    elif ctx.profile == "product":
+        raise RuntimeError("ATTACHMENT_STORAGE_DIR is required in product profile")
+
+    backup_dir_raw = os.getenv("BACKUP_DIR", "").strip()
+    if backup_dir_raw:
+        backup_path = Path(backup_dir_raw)
+        if not backup_path.is_absolute():
+            raise RuntimeError("BACKUP_DIR must be an absolute path")
+        if _paths_overlap(backup_path, REFERRAL_STORAGE_DIR):
+            raise RuntimeError("BACKUP_DIR must not overlap REFERRAL_STORAGE_DIR")
+        if attachment_dir_raw and _paths_overlap(backup_path, Path(attachment_dir_raw)):
+            raise RuntimeError("BACKUP_DIR must not overlap ATTACHMENT_STORAGE_DIR")
+    return ctx
+
+
+def stage1_connect_and_classify(ctx):
+    for attempt in range(60):
+        try:
+            with connect() as db:
+                tables = database_tables(db)
+                if "deployment_identity" in tables:
+                    rows = db.execute(
+                        "SELECT id,profile,tenant_id,deployment_id,bootstrap_completed_at "
+                        "FROM deployment_identity"
+                    ).fetchall()
+                    if len(rows) != 1:
+                        raise RuntimeError(
+                            f"INVALID DB state: deployment_identity has {len(rows)} row(s), expected 1"
+                        )
+                    ident = rows[0]
+                    if (
+                        int(ident["id"]) != 1
+                        or ident["profile"] != ctx.profile
+                        or int(ident["tenant_id"]) != ctx.tenant_id
+                        or ident["deployment_id"] != ctx.deployment_id
+                    ):
+                        raise RuntimeError(
+                            "INVALID DB state: deployment_identity does not match environment"
+                        )
+                    if ident["bootstrap_completed_at"] is not None:
+                        return "INITIALIZED"
+                    if ctx.profile == "sample" and {"seed_metadata", "users", "system_configs"}.issubset(tables):
+                        seed_row = db.execute(
+                            "SELECT batch_key FROM seed_metadata WHERE id=1"
+                        ).fetchone()
+                        user_cnt = db.execute("SELECT COUNT(*) AS cnt FROM users").fetchone()["cnt"]
+                        if seed_row and seed_row["batch_key"] == SEED_BATCH and user_cnt > 0:
+                            _verify_tenant_id_columns_only(db, ctx.tenant_id, tables)
+                            return "LEGACY_SAMPLE"
+                    return "BOOTSTRAP_PENDING"
+
+                if len(tables) == 0:
+                    return "NEW"
+
+                legacy_auth = os.getenv("LEGACY_MIGRATION_AUTHORIZED", "").strip()
+                required_legacy = {"stores", "users", "system_configs", "seed_metadata", "audit_chain", "audit_events"}
+                if (
+                    ctx.profile == "sample"
+                    and legacy_auth == "sample"
+                    and "tenants" not in tables
+                    and required_legacy.issubset(tables)
+                    and set(rental.TABLE_DEFINITIONS).issubset(tables)
+                ):
+                    seed_row = db.execute("SELECT batch_key FROM seed_metadata WHERE id=1").fetchone()
+                    user_cnt = db.execute("SELECT COUNT(*) AS cnt FROM users").fetchone()["cnt"]
+                    if seed_row and seed_row["batch_key"] == SEED_BATCH and user_cnt > 0:
+                        _verify_tenant_id_columns_only(db, ctx.tenant_id, tables)
+                        return "LEGACY_SAMPLE"
+
+                raise RuntimeError(
+                    "INVALID DB state: non-empty database without authorized deployment_identity"
+                )
+        except (pymysql.err.OperationalError, pymysql.err.InterfaceError):
+            if attempt == 59:
+                raise
+            time.sleep(2)
+
+
+def stage2_schema_and_identity(ctx, state):
+    with connect() as db:
+        ensure_schema(db)
+        rental.ensure_rental_schema(db)
+        ensure_system_config(db)
+        ensure_policy_epoch_migration(db)
+        now = now_jst()
+        tenant_label = os.getenv("DEPLOYMENT_NAME", "").strip()[:120] or f"tenant-{ctx.tenant_id}"
+        if state == "NEW":
+            db.execute(
+                """INSERT INTO deployment_identity(id,profile,tenant_id,deployment_id,bootstrap_completed_at,created_at)
+                   VALUES(1,?,?,?,NULL,?)""",
+                (ctx.profile, ctx.tenant_id, ctx.deployment_id, now),
+            )
+            db.execute(
+                "INSERT INTO tenants(id,name,created_at) VALUES(?,?,?)",
+                (ctx.tenant_id, tenant_label, now),
+            )
+        elif state == "LEGACY_SAMPLE":
+            existing_ident = db.execute(
+                "SELECT id FROM deployment_identity WHERE id=1"
+            ).fetchone()
+            if not existing_ident:
+                db.execute(
+                    """INSERT INTO deployment_identity(id,profile,tenant_id,deployment_id,bootstrap_completed_at,created_at)
+                       VALUES(1,?,?,?,NULL,?)""",
+                    (ctx.profile, ctx.tenant_id, ctx.deployment_id, now),
+                )
+            existing_tenant = db.execute("SELECT COUNT(*) AS cnt FROM tenants").fetchone()["cnt"]
+            if existing_tenant == 0:
+                db.execute(
+                    "INSERT INTO tenants(id,name,created_at) VALUES(?,?,?)",
+                    (ctx.tenant_id, tenant_label, now),
+                )
+        db.commit()
+
+
+def stage3_registry_and_integrity(ctx):
+    self_check = {}
+    with connect() as db:
+        tables = database_tables(db)
+        tenant_rows = db.execute("SELECT id,name FROM tenants").fetchall()
+        if len(tenant_rows) != 1 or int(tenant_rows[0]["id"]) != ctx.tenant_id:
+            raise RuntimeError(
+                f"SC-04 tenant registry invariant failed: expected 1 row with id={ctx.tenant_id}, found {len(tenant_rows)}"
+            )
+        tenant_tables = _verify_tenant_id_columns_only(db, ctx.tenant_id, tables)
+        missing_rental = set(rental.TABLE_DEFINITIONS) - set(tenant_tables)
+        if missing_rental:
+            raise RuntimeError(f"SC-04 rental tenant_id columns missing on: {sorted(missing_rental)}")
+        self_check["tenant_invariant"] = {"status": "ok", "tenant_id": ctx.tenant_id, "tables": len(tenant_tables)}
+
+        raw_mfa_key = os.getenv("MFA_ENCRYPTION_KEY", "").strip()
+        key_check_row = db.execute(
+            "SELECT value_json FROM system_configs WHERE config_key=?", ("auth.mfa_key_check",)
+        ).fetchone()
+        mfa_users = db.execute(
+            "SELECT id,employee_code,totp_enabled,totp_secret_enc FROM users "
+            "WHERE totp_enabled=1 OR (totp_secret_enc IS NOT NULL AND totp_secret_enc <> '')"
+        ).fetchall()
+        enrollment_rows = []
+        if "mfa_enrollments" in tables:
+            enrollment_rows = db.execute(
+                "SELECT id,pending_secret_enc FROM mfa_enrollments "
+                "WHERE consumed_at IS NULL AND invalidated_at IS NULL AND pending_secret_enc IS NOT NULL"
+            ).fetchall()
+
+        if key_check_row or mfa_users or enrollment_rows:
+            if not raw_mfa_key:
+                raise RuntimeError("SC-03 fatal: MFA encrypted data exists but MFA_ENCRYPTION_KEY is empty")
+            try:
+                fernet = Fernet(raw_mfa_key.encode("utf-8"))
+            except Exception as exc:
+                raise RuntimeError("SC-03 fatal: MFA_ENCRYPTION_KEY is invalid") from exc
+            if key_check_row:
+                check_data = (
+                    json.loads(key_check_row["value_json"])
+                    if isinstance(key_check_row["value_json"], str)
+                    else key_check_row["value_json"]
+                )
+                if check_data.get("key_fingerprint") != _mfa_key_fingerprint(raw_mfa_key):
+                    raise RuntimeError("SC-03 fatal: MFA_ENCRYPTION_KEY fingerprint mismatch")
+                try:
+                    decrypted_probe = fernet.decrypt(str(check_data.get("probe", "")).encode("utf-8"))
+                except (InvalidToken, ValueError, TypeError) as exc:
+                    raise RuntimeError("SC-03 fatal: MFA_ENCRYPTION_KEY probe decryption failed") from exc
+                if decrypted_probe != MFA_KEY_PROBE_PLAINTEXT:
+                    raise RuntimeError("SC-03 fatal: MFA_ENCRYPTION_KEY probe plaintext mismatch")
+            for u in mfa_users:
+                try:
+                    fernet.decrypt(str(u["totp_secret_enc"]).encode("utf-8"))
+                except (InvalidToken, ValueError, TypeError) as exc:
+                    raise RuntimeError(
+                        f"SC-03 fatal: failed to decrypt totp_secret_enc for user id={u['id']}"
+                    ) from exc
+            for er in enrollment_rows:
+                try:
+                    fernet.decrypt(str(er["pending_secret_enc"]).encode("utf-8"))
+                except (InvalidToken, ValueError, TypeError) as exc:
+                    raise RuntimeError(
+                        f"SC-03 fatal: failed to decrypt pending_secret_enc for enrollment id={er['id']}"
+                    ) from exc
+            self_check["mfa_key"] = {"status": "ok", "verified_users": len(mfa_users)}
+        elif ctx.profile == "sample" and not raw_mfa_key:
+            self_check["mfa_key"] = {
+                "status": "warning",
+                "detail": "MFA_ENCRYPTION_KEY not set in sample profile; MFA endpoints disabled",
+            }
+        else:
+            self_check["mfa_key"] = {"status": "ok", "verified_users": 0}
+
+    attachment_dir_raw = os.getenv("ATTACHMENT_STORAGE_DIR", "").strip()
+    storage_ok = False
+    if attachment_dir_raw:
+        try:
+            att_dir = Path(attachment_dir_raw)
+            att_dir.mkdir(parents=True, exist_ok=True)
+            probe = att_dir / f".write_probe_{os.getpid()}_{uuid.uuid4().hex}"
+            probe.write_bytes(b"ok")
+            probe.unlink(missing_ok=True)
+            storage_ok = True
+        except OSError as exc:
+            if ctx.profile == "product":
+                raise RuntimeError(f"Attachment storage is not writable: {exc}") from exc
+            self_check["storage"] = {"status": "warning", "detail": f"storage not writable: {exc}"}
+    if storage_ok:
+        self_check["storage"] = {"status": "ok"}
+    elif "storage" not in self_check:
+        if ctx.profile == "product":
+            raise RuntimeError("ATTACHMENT_STORAGE_DIR is required and writable in product profile")
+        self_check["storage"] = {"status": "warning", "detail": "ATTACHMENT_STORAGE_DIR not configured"}
+
+    backup_info = _read_backup_status()
+    self_check["backup"] = {
+        "status": "warning" if backup_info["degraded"] else backup_info["status"],
+        "degraded": backup_info["degraded"],
+        "reasons": backup_info.get("reasons", []),
+    }
+
+    webhook_url = os.getenv("MONITOR_WEBHOOK_URL", "").strip()
+    if ctx.profile == "product" and not webhook_url:
+        self_check["monitor_webhook"] = {"status": "warning", "detail": "MONITOR_WEBHOOK_URL not configured"}
+    else:
+        self_check["monitor_webhook"] = {"status": "ok" if webhook_url else "info"}
+
+    self_check["audit_chain"] = {"status": "ok"}
+    return self_check
+
+
+def _read_initial_admin_credentials(db):
+    code = os.getenv("INITIAL_ADMIN_EMPLOYEE_CODE", "").strip().upper()
+    name = os.getenv("INITIAL_ADMIN_NAME", "").strip()
+    pw_file = os.getenv("INITIAL_ADMIN_PASSWORD_FILE", "").strip()
+    if not code or len(code) > 30:
+        raise RuntimeError("INITIAL_ADMIN_EMPLOYEE_CODE is required (1..30 chars) for product bootstrap")
+    if not name or len(name) > 120:
+        raise RuntimeError("INITIAL_ADMIN_NAME is required (1..120 chars) for product bootstrap")
+    password = ""
+    if pw_file:
+        try:
+            password = Path(pw_file).read_text(encoding="utf-8").rstrip("\r\n")
+        except OSError as exc:
+            raise RuntimeError(f"Failed to read INITIAL_ADMIN_PASSWORD_FILE: {exc}") from exc
+    else:
+        password = os.getenv("INITIAL_ADMIN_PASSWORD", "")
+    if not password:
+        raise RuntimeError("INITIAL_ADMIN_PASSWORD_FILE is required for product bootstrap")
+    validate_password(db, password)
+    return code, name, password
+
+
+def stage4_initialize_by_state(ctx, state):
+    with connect() as db:
+        if state in ("NEW", "BOOTSTRAP_PENDING"):
+            if ctx.profile == "product":
+                user_count = db.execute("SELECT COUNT(*) AS cnt FROM users").fetchone()["cnt"]
+                if user_count != 0:
+                    raise RuntimeError(
+                        "BOOTSTRAP_PENDING product DB already has users; refusing automatic admin creation"
+                    )
+                admin_code, admin_name, admin_pw = _read_initial_admin_credentials(db)
+                now = now_jst()
+                encoded_pw = hash_secret(admin_pw)
+                admin_id = db.execute(
+                    """INSERT INTO users(name,role,store_id,employee_code,public_id,display_name,
+                       password_hash,account_status,must_change_password,auth_epoch)
+                       VALUES(?,?,?,?,?,?,?,?,1,1)""",
+                    (admin_name, "executive", None, admin_code, str(uuid.uuid4()),
+                     admin_name, encoded_pw, "ACTIVE"),
+                ).lastrowid
+                db.execute(
+                    "INSERT INTO password_history(user_id,password_hash,created_at) VALUES(?,?,?)",
+                    (admin_id, encoded_pw, now),
+                )
+                audit(db, admin_id, "BOOTSTRAP_ADMIN_CREATED", "user", admin_id,
+                      f"employee_code={admin_code}")
+                db.execute(
+                    "UPDATE deployment_identity SET bootstrap_completed_at=? WHERE id=1",
+                    (now,),
+                )
+                db.commit()
+            else:
+                seed(db, ensure_ddl=False)
+                db.execute(
+                    "UPDATE deployment_identity SET bootstrap_completed_at=? WHERE id=1",
+                    (now_jst(),),
+                )
+                db.commit()
+        elif state == "LEGACY_SAMPLE":
+            now = now_jst()
+            audit(
+                db, None, "LEGACY_SAMPLE_MIGRATED", "deployment_identity", 1,
+                f"deployment_id={ctx.deployment_id}; tenant_id={ctx.tenant_id}",
+            )
+            db.execute(
+                "UPDATE deployment_identity SET bootstrap_completed_at=? WHERE id=1",
+                (now,),
+            )
+            db.commit()
+        elif state == "INITIALIZED":
+            if ctx.profile == "product":
+                user_count = db.execute("SELECT COUNT(*) AS cnt FROM users").fetchone()["cnt"]
+                exec_count = db.execute(
+                    "SELECT COUNT(*) AS cnt FROM users "
+                    "WHERE role IN ('executive','administrator') AND account_status='ACTIVE'"
+                ).fetchone()["cnt"]
+                if user_count == 0 or exec_count == 0:
+                    raise RuntimeError(
+                        "INITIALIZED product DB has no active executive user; fatal maintenance state"
+                    )
+                if any(
+                    os.getenv(k, "").strip()
+                    for k in (
+                        "INITIAL_ADMIN_EMPLOYEE_CODE",
+                        "INITIAL_ADMIN_NAME",
+                        "INITIAL_ADMIN_PASSWORD_FILE",
+                        "INITIAL_ADMIN_PASSWORD",
+                    )
+                ):
+                    LOGGER.warning(
+                        "INITIAL_ADMIN_* variables are ignored after bootstrap; please remove them from environment"
+                    )
+            elif public_sample_mode_enabled():
                 tables = database_tables(db)
                 if not sample_seed_is_complete(db, tables):
-                    recovering_sample = True
                     rental.check_rental_reset_scope(db, existing_tables=tables)
                     storage_keys = referral_reset_storage_keys(db) if "referral_document_files" in tables else []
                     rebuild_demo_data(db, tables, storage_keys)
-            else:
-                seed(db)
-        break
-    except pymysql.MySQLError:
-        if recovering_sample or attempt == 59:
-            raise
-        time.sleep(2)
+            if os.getenv("LEGACY_MIGRATION_AUTHORIZED", "").strip():
+                LOGGER.warning(
+                    "LEGACY_MIGRATION_AUTHORIZED is ignored after initialization; please remove it from environment"
+                )
+
+
+def stage5_finalize(ctx, state, self_check):
+    STARTUP_STATE["state"] = state
+    STARTUP_STATE["self_check"] = self_check
+    try:
+        with connect() as db:
+            ident = db.execute(
+                "SELECT bootstrap_completed_at FROM deployment_identity WHERE id=1"
+            ).fetchone()
+            if not ident or ident["bootstrap_completed_at"] is None:
+                raise RuntimeError("Stage 5 verification failed: bootstrap_completed_at is NULL")
+            summary = {
+                "profile": ctx.profile,
+                "tenant_id": ctx.tenant_id,
+                "deployment_id": ctx.deployment_id,
+                "state": state,
+                "checks": {k: v.get("status") for k, v in self_check.items()},
+            }
+            audit(db, None, "STARTUP_SELF_CHECK", "system", None, json.dumps(summary, sort_keys=True))
+            db.commit()
+        STARTUP_STATE["ready"] = True
+        STARTUP_STATE["ready_at"] = now_jst().isoformat(timespec="seconds")
+    except Exception:
+        STARTUP_STATE["ready"] = False
+        LOGGER.exception("Stage 5 audit/finalization failed; service stays not-ready")
+
+
+def run_startup_sequence():
+    STARTUP_STATE["started_at"] = now_jst().isoformat(timespec="seconds")
+    STARTUP_STATE["ready"] = False
+    ctx = stage0_env_precheck()
+    state = stage1_connect_and_classify(ctx)
+    stage2_schema_and_identity(ctx, state)
+    self_check = stage3_registry_and_integrity(ctx)
+    stage4_initialize_by_state(ctx, state)
+    stage5_finalize(ctx, state, self_check)
+
+
+run_startup_sequence()
 
 
 def role_guard(role, allowed):
@@ -2794,7 +4502,7 @@ def get_households(db, role, user):
 
 
 @app.get("/api/bootstrap")
-def bootstrap(x_demo_role: CurrentActor = Depends(require_actor)):
+def bootstrap(request: Request, x_demo_role: CurrentActor = Depends(require_actor)):
     with connect() as db:
         user = request_user(db, x_demo_role)
         role = str(x_demo_role)
@@ -2808,7 +4516,8 @@ def bootstrap(x_demo_role: CurrentActor = Depends(require_actor)):
             "user": {"id": user["id"], "public_id": user["public_id"],
                      "employee_code": user["employee_code"], "name": user["display_name"],
                      "role": user["role"], "store_id": user["store_id"],
-                     "must_change_password": bool(user["must_change_password"])},
+                     "must_change_password": bool(user["must_change_password"]),
+                     "auth_stage": (lambda sess: sess["auth_stage"] if sess else "FULL")(_session_row(db, request))},
             "role": role, "account_role": user["role"], "roles": roles,
             "permissions": {
                 "advisor": ["households.own", "activities.create", "introductions.create"],
@@ -2825,7 +4534,8 @@ def bootstrap(x_demo_role: CurrentActor = Depends(require_actor)):
             ]),
             "enums": {"stages": STAGES, "roles": [item["id"] for item in roles]},
             "environment": {"demo": demo_mode_enabled(),
-                            "public_sample": public_sample_mode_enabled()},
+                            "public_sample": public_sample_mode_enabled(),
+                            "profile": deployment_profile()},
         }
         if public_sample_mode_enabled():
             identity.update(
@@ -5111,12 +6821,14 @@ def save_report(payload: ReportInput, x_demo_role: CurrentActor = Depends(requir
 
 
 def require_reset_mode():
-    if not sample_or_demo_enabled():
+    if is_product_profile() or not sample_or_demo_enabled():
         raise HTTPException(403, "デモモードは無効です")
 
 
 @app.post("/api/reset", dependencies=[Depends(require_reset_mode)])
 def reset_demo(request: Request, x_demo_role: CurrentActor = Depends(require_actor)):
+    if is_product_profile() or not sample_or_demo_enabled():
+        raise HTTPException(403, "デモモードは無効です")
     role_guard(x_demo_role, ("hq_finance",))
     guard = request.state.sample_guard
     with connect() as db:
@@ -6416,11 +8128,99 @@ def operations_status(actor: CurrentActor = Depends(require_actor)):
     }
 
 
+def _is_degraded(backup_info: dict) -> bool:
+    for item in STARTUP_STATE.get("self_check", {}).values():
+        if isinstance(item, dict) and item.get("status") == "warning":
+            return True
+    return bool(backup_info.get("degraded"))
+
+
 @app.get("/api/health")
 def health():
-    with connect() as db:
-        db.execute("SELECT 1")
-    return {"status": "ok"}
+    try:
+        with connect() as db:
+            db.execute("SELECT 1")
+    except Exception:
+        return JSONResponse(
+            {"status": "error", "db": "error", "version": APP_VERSION},
+            status_code=503,
+        )
+    backup_info = _read_backup_status()
+    if _is_degraded(backup_info):
+        return {"status": "degraded", "db": "ok", "version": APP_VERSION}
+    return {"status": "ok", "db": "ok", "version": APP_VERSION}
+
+
+@app.get("/api/health/ready")
+def health_ready():
+    if not STARTUP_STATE.get("ready"):
+        return JSONResponse(
+            {"status": "not_ready", "ready": False, "version": APP_VERSION},
+            status_code=503,
+        )
+    try:
+        with connect() as db:
+            db.execute("SELECT 1")
+    except Exception:
+        return JSONResponse(
+            {"status": "error", "ready": False, "db": "error", "version": APP_VERSION},
+            status_code=503,
+        )
+    return {"status": "ready", "ready": True, "db": "ok", "version": APP_VERSION}
+
+
+@app.get("/api/ops/status-detail")
+def ops_status_detail(request: Request):
+    expected = os.getenv("OPS_STATUS_TOKEN", "").strip()
+    if not expected:
+        raise HTTPException(404, "Not Found")
+    presented = request.headers.get("x-ops-token", "")
+    if not presented or not hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8")):
+        raise HTTPException(403, "Forbidden")
+
+    db_status = "ok"
+    try:
+        with connect() as db:
+            db.execute("SELECT 1")
+    except Exception:
+        db_status = "error"
+
+    backup_info = _read_backup_status()
+    disk = {}
+    targets = [("root", Path("/"))]
+    att_dir = os.getenv("ATTACHMENT_STORAGE_DIR", "").strip()
+    if att_dir and Path(att_dir).exists():
+        targets.append(("attachment_storage", Path(att_dir)))
+    for label, path_obj in targets:
+        try:
+            usage = shutil.disk_usage(path_obj)
+            disk[label] = {
+                "total_bytes": usage.total,
+                "used_bytes": usage.used,
+                "free_bytes": usage.free,
+                "free_percent": round(usage.free * 100.0 / usage.total, 2) if usage.total else 0.0,
+            }
+        except OSError:
+            disk[label] = {"error": "unavailable"}
+
+    return {
+        "profile": deployment_profile(),
+        "tenant_id": deployment_tenant_id(),
+        "deployment_id": deployment_id(),
+        "app_version": APP_VERSION,
+        "build_revision": read_build_revision(),
+        "ready": bool(STARTUP_STATE.get("ready")),
+        "bootstrap_state": STARTUP_STATE.get("state"),
+        "db": db_status,
+        "self_check": STARTUP_STATE.get("self_check", {}),
+        "backup": backup_info,
+        "disk": disk,
+        "clock": {
+            "utc_now": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "jst_now": now_jst().isoformat(timespec="seconds"),
+            "epoch_seconds": round(time.time(), 3),
+        },
+    }
 
 
 rental.register_rental_routes(app, connect, require_actor, audit)

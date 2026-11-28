@@ -1,0 +1,97 @@
+backend/deployment_context.py:11:_TENANT_ID_RE = re.compile(r"^[1-9]\d*$")
+backend/deployment_context.py:45:    raw_tenant = os.getenv("DEPLOYMENT_TENANT_ID", "").strip()
+backend/deployment_context.py:46:    if not _TENANT_ID_RE.fullmatch(raw_tenant):
+backend/deployment_context.py:48:            "DEPLOYMENT_TENANT_ID is required and must be a positive integer"
+backend/deployment_context.py:52:        raise RuntimeError("DEPLOYMENT_TENANT_ID is out of range")
+backend/deployment_context.py:55:        raise RuntimeError("DEPLOYMENT_TENANT_ID must be 1 when DEPLOYMENT_PROFILE=sample")
+backend/rental.py:1027:                f"SELECT * FROM {table} WHERE tenant_id=? AND id=?{suffix}", (TENANT_ID, row_id),
+backend/rental.py:1055:                          (TENANT_ID, *([party_id] * len(columns)))).fetchone():
+backend/rental.py:1059:        values = dict(values, tenant_id=TENANT_ID, created_by=actor.user_id, updated_by=actor.user_id)
+backend/rental.py:1072:            (*values.values(), actor.user_id, TENANT_ID, row["id"], row["version"]),
+backend/rental.py:1102:            (TENANT_ID, contract_id),
+backend/rental.py:1126:                    (TENANT_ID, unit_id, contract.get("id", 0)),
+backend/rental.py:1178:                (TENANT_ID, unit_id, today, today, today, today),
+backend/rental.py:1193:               FROM charge_types WHERE tenant_id=? AND status='ACTIVE' ORDER BY id""", (TENANT_ID,),
+backend/rental.py:1209:                existing = db.execute("SELECT charge_code FROM charge_types WHERE tenant_id=?", (TENANT_ID,)).fetchall()
+backend/rental.py:1230:            (TENANT_ID, lease["unit_id"], lease.get("id", 0)),
+backend/rental.py:1245:            (TENANT_ID, unit_id),
+backend/rental.py:1248:            "SELECT status FROM applications WHERE tenant_id=? AND unit_id=?", (TENANT_ID, unit_id),
+backend/rental.py:1271:                   WHERE tenant_id=? AND building_id=? GROUP BY occupancy_status""", (TENANT_ID, row_id),
+backend/rental.py:1285:                (TENANT_ID, row_id, today, today, today, today),
+backend/rental.py:1297:                (TENANT_ID, row_id, today, today, today, today),
+backend/rental.py:1302:                (TENANT_ID, row_id),
+backend/rental.py:1309:                (TENANT_ID, row_id),
+backend/rental.py:1378:                       (f"P-{row_id}", TENANT_ID, row_id))
+backend/rental.py:1429:                              (TENANT_ID, row_id)).fetchone():
+backend/rental.py:1519:                (TENANT_ID, row["unit_id"], row["id"]),
+backend/rental.py:1577:        if db.execute("SELECT id FROM leases WHERE tenant_id=? AND application_id=?", (TENANT_ID, row_id)).fetchone():
+backend/rental.py:1597:        args = [TENANT_ID]
+backend/rental.py:1659:                   WHERE tenant_id=? AND status='ACTIVE' ORDER BY id LIMIT ? OFFSET ?""", (TENANT_ID, limit, offset),
+backend/rental.py:1760:            (TENANT_ID, unit_id, end, start, end, start),
+backend/rental.py:1786:            (TENANT_ID, lease_id),
+backend/rental.py:1865:                (TENANT_ID, last_day, last_day, month),
+backend/rental.py:1872:                   AND charge_code IN ('RENT','COMMON_FEE') ORDER BY id""", (TENANT_ID,),
+backend/rental.py:1878:                    (TENANT_ID, month),
+backend/rental.py:18:TENANT_ID = deployment_tenant_id()
+backend/rental.py:1959:                FROM payment_allocations WHERE tenant_id=? AND {key}=?""", (TENANT_ID, row_id),
+backend/rental.py:1964:        args = [TENANT_ID]
+backend/rental.py:1984:        args = [TENANT_ID]
+backend/rental.py:2048:                    ORDER BY oldest_due_date,l.id LIMIT ? OFFSET ?""", (TENANT_ID, today, limit, offset),
+backend/rental.py:2087:                          (TENANT_ID, key)).fetchone()
+backend/rental.py:2100:               ) LIMIT 1""", (TENANT_ID, payment["id"]),
+backend/rental.py:2122:                             (TENANT_ID, code)).fetchone()
+backend/rental.py:2144:        args = [TENANT_ID]
+backend/rental.py:2267:               ORDER BY id""", (TENANT_ID, source, row_id),
+backend/rental.py:2356:                (TENANT_ID, row_id),
+backend/rental.py:2363:                     AND s.status='FINALIZED' LIMIT 1""", (TENANT_ID, row_id),
+backend/rental.py:2432:                   ORDER BY d.id DESC LIMIT ? OFFSET ?""", (TENANT_ID, lease_id, lease_id, limit, offset),
+backend/rental.py:2572:            (TENANT_ID,) * 9,
+backend/rental.py:2598:            (TENANT_ID,),
+backend/rental.py:2604:               GROUP BY s.management_contract_id""", (TENANT_ID,),
+backend/rental.py:2615:               GROUP BY s.management_contract_id""", (TENANT_ID,),
+backend/rental.py:2626:                ) GROUP BY e.management_contract_id,f.account_code,e.entry_type""", (TENANT_ID,),
+backend/rental.py:2651:            (TENANT_ID, row_id),
+backend/rental.py:2661:            (TENANT_ID, row["management_contract_id"], _month_shift(row["settlement_month"], 1)),
+backend/rental.py:2683:                (TENANT_ID, row["id"]),
+backend/rental.py:2730:                (TENANT_ID, month, month_end(month)),
+backend/rental.py:2741:               GROUP BY entry_type""", (TENANT_ID, month),
+backend/rental.py:2752:            (TENANT_ID, start, end),
+backend/rental.py:2760:               ORDER BY id""", (TENANT_ID, month, month_end(month)),
+backend/rental.py:2820:                   AND status IN ('DRAFT','SUBMITTED','APPROVED') LIMIT 1""", (TENANT_ID, day),
+backend/rental.py:2838:            (TENANT_ID, contract_id),
+backend/rental.py:2847:        args = (TENANT_ID, contract_id, escrow["id"])
+backend/rental.py:2872:            (TENANT_ID, contract_id, cutoff),
+backend/rental.py:2902:               GROUP BY l.source_type,l.source_id""", (TENANT_ID, contract_id, month),
+backend/rental.py:2948:               ORDER BY w.cost_confirmed_at,w.id""", (TENANT_ID, contract_id),
+backend/rental.py:3026:        filters, args = ["s.tenant_id=?"], [TENANT_ID]
+backend/rental.py:306:        if db.execute(f"SELECT 1 FROM {table} WHERE tenant_id <> ? LIMIT 1", (TENANT_ID,)).fetchone():
+backend/rental.py:3077:                       (json.dumps(snapshot, ensure_ascii=False), TENANT_ID, row_id))
+backend/rental.py:3108:                               (TENANT_ID, prior_id)).fetchone()
+backend/rental.py:3123:                     AND s.status<>'CANCELLED'""", (TENANT_ID, prior_id),
+backend/rental.py:333:                           (TENANT_ID,))
+backend/rental.py:334:        db.execute(f"DELETE FROM {table} WHERE tenant_id=?", (TENANT_ID,))
+backend/rental.py:3393:            (month, TENANT_ID) if month is not None else (TENANT_ID,),
+backend/rental.py:3423:        args = [TENANT_ID]
+backend/rental.py:343:        values = dict(tenant_id=TENANT_ID, created_at=stamp, updated_at=stamp, **fields)
+backend/rental.py:3456:                (*([service_month] * 7), TENANT_ID, month_end(service_month), *contract_args, limit, offset),
+backend/rental.py:3501:            (TENANT_ID, complaint_id),
+backend/rental.py:3725:            (TENANT_ID, *args, limit, offset),
+backend/rental.py:3768:                        (TENANT_ID, row_id),
+backend/rental.py:527:                   ("CONTRACTING" if status == "APPROVED" else "APPLYING", TENANT_ID, unit_id))
+backend/rental.py:600:        (today, today, TENANT_ID, today, today, today, today),
+backend/rental.py:618:        (today, TENANT_ID, month),
+backend/rental.py:632:        (TENANT_ID, TENANT_ID, TENANT_ID, today, TENANT_ID, TENANT_ID, TENANT_ID),
+backend/rental.py:666:                   WHERE oa.tenant_id=? AND oa.user_id=?""", (TENANT_ID, actor.user_id),
+backend/rental.py:712:                   )""", (today, today, TENANT_ID, owner_id, today, today, today, today),
+backend/rental.py:718:                (TENANT_ID, owner_id, month, today),
+backend/rental.py:732:                (TENANT_ID, owner_id, month, next_month),
+backend/rental.py:737:                (TENANT_ID, owner_id, year, today),
+backend/rental.py:741:                    {owner_settlement_scope}""", (TENANT_ID, owner_id),
+backend/rental.py:777:                    (TENANT_ID, owner_id, today, today, today, limit, offset),
+backend/rental.py:791:                (today, today, today, today, TENANT_ID, owner_id, limit, offset),
+backend/rental.py:807:                (TENANT_ID, owner_id, limit, offset),
+backend/rental.py:817:                (TENANT_ID, owner_id, settlement_id),
+backend/rental.py:825:                    (TENANT_ID, settlement_id, owner_id),
+backend/rental.py:836:                    ORDER BY l.id""", (TENANT_ID, owner_id, settlement_id),
+backend/rental.py:841:                    {owner_remittance_scope} AND s.id=? ORDER BY r.id""", (TENANT_ID, owner_id, settlement_id),
+backend/rental.py:862:                (TENANT_ID, owner_id, limit, offset),
