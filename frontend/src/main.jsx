@@ -308,7 +308,7 @@ const COPY = {
     queueRisk: "リスク", riskNone: "通常", riskWatch: "要確認", riskHigh: "優先",
     saveQueueAction: "行動を保存", noNegotiations: "対応対象の商談はありません。",
     systemManagement: "\u30b7\u30b9\u30c6\u30e0\u7ba1\u7406", descHouseholds: "\u9867\u5ba2\u30fb\u4e16\u5e2f\u306e\u4e00\u89a7\u3001\u8a73\u7d30\u3001\u5c65\u6b74", descIntroductions: "\u7d39\u4ecb\u3068\u5546\u8ac7\u306e\u9032\u6357\u7ba1\u7406", descRevenue: "\u7740\u5de5\u78ba\u8a8d\u3068\u5831\u916c\u306e\u51e6\u7406\u72b6\u6cc1", descTeam: "\u5168\u54e1\u306e\u65e5\u7a0b\u3001\u63b2\u793a\u677f\u3001\u5546\u8ac7\u30ad\u30e5\u30fc", descManagement: "\u7d4c\u55b6\u6307\u6a19\u3068\u5e97\u8217\u904b\u55b6\u306e\u72b6\u6cc1", descSettings: "\u8868\u793a\u3001\u901a\u77e5\u3001\u696d\u52d9\u306e\u8a2d\u5b9a", descAccounts: "\u30a2\u30ab\u30a6\u30f3\u30c8\u3068\u6a29\u9650\u306e\u7ba1\u7406",
-    copyright: "Copyright SUZIRUI · V3.0.1",
+    copyright: "© 2026 SUZIRUI · V3.0.2",
   },
   zh: {
     summaryOriginal: "原文",
@@ -601,7 +601,7 @@ const COPY = {
     queueAction: "下一步行动", queueOwner: "负责人", queueStage: "洽谈阶段",
     queueRisk: "风险", riskNone: "正常", riskWatch: "需关注", riskHigh: "优先",
     saveQueueAction: "保存行动", noNegotiations: "暂无待处理洽谈。",
-    copyright: "Copyright SUZIRUI · V3.0.1",
+    copyright: "© 2026 SUZIRUI · V3.0.2",
   },
 };
 
